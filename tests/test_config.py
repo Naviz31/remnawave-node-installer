@@ -8,7 +8,7 @@ class ConfigTests(unittest.TestCase):
     def test_nginx_never_listens_on_external_443(self):
         text = nginx_config("node.example.com", certificate=True)
         self.assertNotIn("listen 443", text)
-        self.assertIn("listen unix:/dev/shm/nginx.sock ssl;", text)
+        self.assertIn("listen unix:/dev/shm/nginx.sock ssl proxy_protocol;", text)
         self.assertNotIn("9443", text)
         self.assertIn("ssl_certificate /etc/letsencrypt/live/node.example.com/fullchain.pem", text)
 
@@ -18,6 +18,18 @@ class ConfigTests(unittest.TestCase):
         text = site_file.read_text(encoding="utf-8")
         for word in forbidden:
             self.assertNotIn(word, text)
+
+    def test_site_identity_changes_generated_brand(self):
+        from tempfile import TemporaryDirectory
+
+        from remnawave_node.website import generate_site
+
+        with TemporaryDirectory() as first, TemporaryDirectory() as second:
+            generate_site(Path(first), "node-one.example.com")
+            generate_site(Path(second), "node-two.example.com")
+            first_text = (Path(first) / "index.html").read_text(encoding="utf-8")
+            second_text = (Path(second) / "index.html").read_text(encoding="utf-8")
+            self.assertNotEqual(first_text, second_text)
 
 
 if __name__ == "__main__":

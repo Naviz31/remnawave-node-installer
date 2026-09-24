@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import Dict
 
-from .constants import NODE_CONTAINER, NODE_IMAGE, NODE_PORT
+from .constants import NODE_CONTAINER, NODE_IMAGE
 from .security import env_line, read_env_file, write_private
 from .system import CommandRunner
 

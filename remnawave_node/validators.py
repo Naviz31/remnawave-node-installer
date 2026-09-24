@@ -1,7 +1,7 @@
 import ipaddress
 import re
 import socket
-from typing import Iterable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 
 DOMAIN_RE = re.compile(r"^(?=.{1,253}\Z)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}\Z")

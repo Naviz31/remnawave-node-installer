@@ -1,6 +1,6 @@
 import unittest
 
-from remnawave_node.firewall import apply_plan, build_iptables_plan, build_nft_plan, build_ufw_plan
+from remnawave_node.firewall import apply_plan, build_iptables_plan, build_nft_plan, build_ufw_plan, detect_backend
 from remnawave_node.system import CommandResult
 
 
@@ -10,6 +10,29 @@ class FakeRunner:
 
     def run(self, args, **kwargs):
         self.commands.append(args)
+        return CommandResult(0, "")
+
+
+class UfwStatusRunner(FakeRunner):
+    def run(self, args, **kwargs):
+        self.commands.append(args)
+        if args == ["ufw", "status"]:
+            return CommandResult(0, "Status: active\n8080/tcp ALLOW IN Anywhere\n2222/tcp ALLOW IN 203.0.113.10\n")
+        return CommandResult(0, "")
+
+
+class BackendRunner:
+    def __init__(self, nft_json="{}"):
+        self.nft_json = nft_json
+
+    def exists(self, command):
+        return command in {"nft", "iptables"}
+
+    def run(self, args, **kwargs):
+        if args == ["nft", "list", "ruleset"]:
+            return CommandResult(0, "table ip filter { chain FORWARD {} }")
+        if args == ["nft", "-j", "list", "ruleset"]:
+            return CommandResult(0, self.nft_json)
         return CommandResult(0, "")
 
 
@@ -37,6 +60,18 @@ class FirewallTests(unittest.TestCase):
         runner = FakeRunner()
         created = apply_plan(build_ufw_plan(["203.0.113.10"], 22), runner)
         self.assertIn("ufw:203.0.113.10:2222", created)
+
+    def test_ufw_matching_does_not_treat_8080_as_port_80(self):
+        runner = UfwStatusRunner()
+        apply_plan(build_ufw_plan(["203.0.113.10"], 22), runner)
+        self.assertIn(["ufw", "allow", "80/tcp", "comment", "remnawave-node http"], runner.commands)
+
+    def test_nft_rules_without_native_input_chain_fall_back_to_iptables(self):
+        self.assertEqual(detect_backend(BackendRunner()), "iptables")
+
+    def test_native_inet_input_chain_selects_nftables(self):
+        payload = '{"nftables":[{"chain":{"family":"inet","table":"filter","name":"input","type":"filter","hook":"input","prio":0,"policy":"accept"}}]}'
+        self.assertEqual(detect_backend(BackendRunner(payload)), "nftables")
 
     def test_empty_panel_ips_warn(self):
         self.assertTrue(build_ufw_plan([], 22).warnings)

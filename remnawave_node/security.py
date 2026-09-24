@@ -2,7 +2,7 @@ import os
 import re
 import tempfile
 from pathlib import Path
-from typing import Iterable, Mapping, Optional
+from typing import Iterable, Mapping
 
 
 SECRET_MARKER = "[REDACTED]"

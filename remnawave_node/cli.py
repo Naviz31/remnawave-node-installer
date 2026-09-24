@@ -1,6 +1,8 @@
 import argparse
 import getpass
+import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -92,10 +94,30 @@ def _runner() -> CommandRunner:
     return CommandRunner(configure_logger(INSTALLER_LOG))
 
 
+def latest_node_image(runner: CommandRunner, current_image: str) -> str:
+    repository = current_image.rsplit(":", 1)[0] if ":" in current_image.rsplit("/", 1)[-1] else current_image
+    endpoint = f"https://hub.docker.com/v2/repositories/{repository}/tags?page_size=100&ordering=last_updated"
+    result = runner.run(["curl", "-fsS", "--max-time", "20", endpoint], check=False, timeout=30)
+    if result.returncode != 0:
+        raise InstallerError("не удалось получить список версий remnawave/node с Docker Hub", stage="update")
+    try:
+        tags = [item["name"] for item in json.loads(result.stdout).get("results", [])]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise InstallerError("Docker Hub вернул некорректный список версий Node", stage="update") from exc
+    versions = []
+    for tag in tags:
+        match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", tag)
+        if match:
+            versions.append((tuple(int(part) for part in match.groups()), tag))
+    if not versions:
+        raise InstallerError("на Docker Hub не найдены стабильные semver-теги Node", stage="update")
+    return f"{repository}:{max(versions)[1]}"
+
+
 def show_status() -> int:
     state = _load_state()
     runner = _runner()
-    health = check_health(runner, NODE_DIR, int(state.get("node_port", NODE_PORT)))
+    health = check_health(runner, NODE_DIR, int(state.get("node_port", NODE_PORT)), state.get("domain"))
     title(APP_NAME)
     kv("Домен", state.get("domain", "не задан"))
     kv("ОС", f"{read_os_release().get('PRETTY_NAME', 'unknown')}")
@@ -104,6 +126,7 @@ def show_status() -> int:
     kv("Nginx", health.get("nginx", "unknown"), "ok" if health.get("nginx") == "valid" else "error")
     kv("Cover", health.get("cover_backend", "unknown"), "ok" if health.get("cover_backend") == "listening" else "warn")
     kv("Node API", health.get("node_port", "unknown"), "ok" if health.get("node_port") == "listening" else "warn")
+    kv("Self-Steal", health.get("self_steal", "unknown"), "ok" if health.get("self_steal") in {"ok", "not-checked"} else "error")
     kv("Xray", health.get("xray", "unknown"), "ok" if health.get("xray") == "listening" else "warn")
     return 0
 
@@ -112,7 +135,7 @@ def doctor() -> int:
     state = _load_state()
     runner = _runner()
     title("Диагностика Remnawave Node")
-    health = check_health(runner, NODE_DIR, int(state.get("node_port", NODE_PORT)))
+    health = check_health(runner, NODE_DIR, int(state.get("node_port", NODE_PORT)), state.get("domain"))
     checks = {
         "state manifest": STATE_FILE.is_file(),
         "node .env mode 0600": NODE_DIR.joinpath(".env").exists() and oct(NODE_DIR.joinpath(".env").stat().st_mode & 0o777) == "0o600",
@@ -121,6 +144,7 @@ def doctor() -> int:
         "nginx config": health.get("nginx") == "valid",
         "cover unix socket": health.get("cover_backend") == "listening",
         "node port": health.get("node_port") == "listening",
+        "self-steal HTTPS": health.get("self_steal") in {"ok", "not-checked"},
         "firewall record": bool(state.get("created_firewall")),
     }
     for label, passed in checks.items():
@@ -139,7 +163,7 @@ def repair() -> int:
     runner = _runner()
     write_node_config(NODE_DIR, node_port=int(state.get("node_port", NODE_PORT)), secret=secret, image=state.get("image", NODE_IMAGE), runner=runner)
     compose(runner, NODE_DIR, "up", "-d")
-    generate_site(SITE_ROOT)
+    generate_site(SITE_ROOT, domain)
     write_nginx_config(domain, certificate=True, runner=runner)
     panel_ips = panel_ips_from_environment() or state.get("panel_ips", [])
     if not panel_ips:
@@ -161,7 +185,7 @@ def repair() -> int:
         plan = build_nft_plan(panel_ips, ssh_port, node_port)
     state["created_firewall"] = apply_plan(plan, runner)
     state["panel_ips"] = panel_ips
-    health = check_health(runner, NODE_DIR, int(state.get("node_port", NODE_PORT)))
+    health = check_health(runner, NODE_DIR, int(state.get("node_port", NODE_PORT)), state.get("domain"))
     StateStore().save({**state, "health_after_repair": health, "status": "installed"})
     return 0 if health.get("container") == "running" and health.get("nginx") == "valid" else 1
 
@@ -183,7 +207,7 @@ def set_secret() -> int:
     runner = _runner()
     try:
         compose(runner, NODE_DIR, "up", "-d")
-        health = check_health(runner, NODE_DIR, int(state.get("node_port", NODE_PORT)))
+        health = check_health(runner, NODE_DIR, int(state.get("node_port", NODE_PORT)), state.get("domain"))
         if health.get("container") != "running":
             raise InstallerError("контейнер не запустился после смены ключа")
     except Exception:
@@ -199,30 +223,38 @@ def update() -> int:
     state = _load_state()
     runner = _runner()
     old_image = state.get("image", NODE_IMAGE)
+    values = read_node_config(NODE_DIR)
+    secret = values.get("SECRET_KEY", "")
+    if not secret:
+        raise InstallerError("SECRET_KEY не найден в закрытом .env; используйте set-secret")
+    target_image = latest_node_image(runner, old_image)
     old_id_result = runner.run(["docker", "image", "inspect", old_image, "--format", "{{.Id}}"], check=False, timeout=60)
     old_id = old_id_result.stdout.strip() if old_id_result.returncode == 0 else ""
-    backup_tag = f"remnawave/node:installer-rollback-{int(time.time())}"
+    repository = old_image.rsplit(":", 1)[0] if ":" in old_image.rsplit("/", 1)[-1] else old_image
+    backup_tag = f"{repository}:installer-rollback-{int(time.time())}"
     rollback_tagged = bool(old_id) and runner.run(["docker", "tag", old_image, backup_tag], check=False, timeout=60).returncode == 0
     try:
-        step("Загрузка новой версии образа", "running")
+        step(f"Загрузка версии {target_image.rsplit(':', 1)[-1]}", "running")
+        write_node_config(NODE_DIR, node_port=int(state.get("node_port", NODE_PORT)), secret=secret, image=target_image, runner=runner)
         compose(runner, NODE_DIR, "pull")
         compose(runner, NODE_DIR, "up", "-d")
-        health = check_health(runner, NODE_DIR, int(state.get("node_port", NODE_PORT)))
-        if health.get("container") != "running":
-            raise InstallerError("новый контейнер не подтвердил состояние running")
+        health = check_health(runner, NODE_DIR, int(state.get("node_port", NODE_PORT)), state.get("domain"))
+        if health.get("container") != "running" or health.get("self_steal") == "failed":
+            raise InstallerError("новый контейнер не подтвердил running и Self-Steal health check")
     except Exception:
         step("Обновление не прошло; возвращаю предыдущий образ", "warn")
         compose(runner, NODE_DIR, "down", check=False)
         if rollback_tagged:
             runner.run(["docker", "tag", backup_tag, old_image], check=False, timeout=60)
+        write_node_config(NODE_DIR, node_port=int(state.get("node_port", NODE_PORT)), secret=secret, image=old_image, runner=runner)
         compose(runner, NODE_DIR, "up", "-d", check=False)
         if rollback_tagged:
             runner.run(["docker", "rmi", backup_tag], check=False, timeout=60)
         raise
-    new_id_result = runner.run(["docker", "image", "inspect", old_image, "--format", "{{.Id}}"], check=False, timeout=60)
+    new_id_result = runner.run(["docker", "image", "inspect", target_image, "--format", "{{.Id}}"], check=False, timeout=60)
     if rollback_tagged:
         runner.run(["docker", "rmi", backup_tag], check=False, timeout=60)
-    StateStore().save({**state, "image": old_image, "image_id": new_id_result.stdout.strip(), "last_update": time.time()})
+    StateStore().save({**state, "image": target_image, "image_id": new_id_result.stdout.strip(), "last_update": time.time()})
     step("Обновление", "ok")
     return 0
 
@@ -262,7 +294,7 @@ def uninstall(confirmed: bool) -> int:
 
 def logs() -> int:
     _root_check()
-    state = _load_state()
+    _load_state()
     runner = _runner()
     return runner.stream(["docker", "compose", "-f", str(NODE_DIR / "docker-compose.yml"), "logs", "--tail=200", "-f"], check=False)
 

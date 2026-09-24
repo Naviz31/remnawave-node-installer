@@ -23,7 +23,7 @@ def detect_backend(runner: CommandRunner) -> str:
             return "ufw"
     if runner.exists("nft"):
         result = runner.run(["nft", "list", "ruleset"], check=False, timeout=15)
-        if result.returncode == 0 and result.stdout.strip():
+        if result.returncode == 0 and result.stdout.strip() and find_nft_input_chain(runner):
             return "nftables"
     if runner.exists("iptables"):
         return "iptables"
@@ -133,7 +133,7 @@ def apply_plan(plan: FirewallPlan, runner: CommandRunner) -> List[str]:
             else:
                 port = next((token.split("/", 1)[0] for token in command if "/tcp" in token), "")
             source = command[command.index("from") + 1] if "from" in command else ""
-            already_present = bool(port and port in current and (not source or source in current))
+            already_present = _ufw_rule_present(current, port, source)
             if not already_present:
                 runner.run(command, timeout=30)
                 created.append(f"ufw:{source}:{port}" if source else f"ufw:base:{port}")
@@ -141,6 +141,22 @@ def apply_plan(plan: FirewallPlan, runner: CommandRunner) -> List[str]:
     for command in plan.commands:
         runner.run(command, timeout=30)
     return list(plan.identifiers)
+
+
+def _ufw_rule_present(current: str, port: str, source: str) -> bool:
+    if not port:
+        return False
+    expected = f"{port}/tcp"
+    for raw_line in current.splitlines():
+        line = " ".join(raw_line.split())
+        if not line.startswith(expected + " ") or "ALLOW" not in line:
+            continue
+        if source:
+            if source in line.split():
+                return True
+        elif "Anywhere" in line:
+            return True
+    return False
 
 
 def _remove_nft_rule(family: str, table: str, parent: str, target_chain: str, node_port: str, runner: CommandRunner) -> None:

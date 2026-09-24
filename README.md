@@ -97,10 +97,11 @@ Logrotate → Health checks → install-state.json
 ## 🔐 Firewall и SSH
 
 - существующая UFW не сбрасывается и не заменяется;
-- при nftables используется существующая `inet input` chain, если она есть;
+- native nftables выбирается только при наличии подходящей существующей `inet input` chain; Docker `iptables-nft` сам по себе не переключает установщик на nftables;
 - при iptables создаётся отдельная цепочка `REMNAWAVE_NODE`;
 - iptables-jump матчится только на `NODE_PORT`, поэтому правила SSH/HTTP/HTTPS администратора не обходятся;
 - `NODE_PORT` не открывается всему интернету;
+- Self-Steal socket принимает PROXY protocol v1 (`xver: 1`) через `proxy_protocol`;
 - Fail2ban получает отдельный jail для SSH и не перезаписывает чужие jail;
 - опасные операции `iptables -F`, `nft flush ruleset` и `ufw reset` не используются.
 
@@ -113,7 +114,7 @@ Logrotate → Health checks → install-state.json
 | `remnawave-node status` | короткий dashboard состояния |
 | `remnawave-node doctor` | расширенная диагностика и рекомендации |
 | `remnawave-node repair` | восстановление управляемых файлов и контейнера |
-| `remnawave-node update` | pull текущего зафиксированного образа и health check |
+| `remnawave-node update` | выбор последнего стабильного semver-тега Docker Hub, pull и rollback при ошибке |
 | `remnawave-node set-secret` | скрытая смена `SECRET_KEY` с возвратом при ошибке |
 | `remnawave-node logs` | последние логи контейнера в режиме follow |
 | `remnawave-node uninstall` | удаление только ресурсов из manifest |
@@ -199,7 +200,7 @@ sudo docker compose -f /opt/remnanode/docker-compose.yml config --quiet
 sudo remnawave-node doctor
 ```
 
-Полная проверка firewall, выпуска сертификата, подключения панели и получения Config Profile требует реального VPS с DNS и Remnawave Panel.
+Полная проверка firewall, выпуска сертификата, подключения панели и получения Config Profile требует реального VPS с DNS и Remnawave Panel. Если Xray уже слушает `:443`, команда `doctor` дополнительно делает реальный `curl https://домен/` и проверяет HTTP 200 с HTML, а не только наличие Unix socket.
 
 ## 📁 Структура
 

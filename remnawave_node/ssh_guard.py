@@ -1,5 +1,3 @@
-from pathlib import Path
-
 from .constants import FAIL2BAN_CONFIG
 from .system import CommandRunner
 

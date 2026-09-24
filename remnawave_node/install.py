@@ -1,13 +1,12 @@
 import os
 import shutil
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
 from .certificates import install_renewal_hook, issue_certificate
 from .compose import compose, write_node_config
 from .constants import (
     APP_NAME,
-    BACKUP_DIR,
     FAIL2BAN_CONFIG,
     INSTALLER_DIR,
     INSTALLER_LOG,
@@ -17,17 +16,16 @@ from .constants import (
     NODE_LOG_DIR,
     NODE_PORT,
     RENEWAL_HOOK,
-    STATE_FILE,
 )
 from .errors import InstallerError
-from .firewall import apply_plan, build_iptables_plan, build_nft_plan, detect_backend, find_nft_input_chain
+from .firewall import apply_plan, build_iptables_plan, build_nft_plan, build_ufw_plan, detect_backend, find_nft_input_chain
 from .health import check_health
 from .logging_utils import configure_logger
 from .nginx import write_nginx_config
-from .preflight import PreflightReport, run_preflight
-from .security import env_line, read_env_file, write_private
+from .preflight import run_preflight
+from .security import read_env_file
 from .ssh_guard import configure_fail2ban, detect_ssh_port
-from .state import InstallTransaction, StateStore
+from .state import InstallTransaction
 from .system import CommandRunner, installed_packages, is_service_active, package_installed
 from .ui import error_box, kv, step, title
 from .validators import parse_ips, valid_port
@@ -61,7 +59,7 @@ def node_port_from_environment() -> int:
 
 
 def install_packages(runner: CommandRunner, tx: InstallTransaction) -> None:
-    packages = ["ca-certificates", "curl", "dnsutils", "fail2ban", "logrotate", "nginx", "certbot", "iproute2"]
+    packages = ["ca-certificates", "curl", "dnsutils", "fail2ban", "logrotate", "nginx", "certbot", "iproute2", "nftables"]
     missing = [name for name in packages if not package_installed(name)]
     if missing:
         tx.data.setdefault("installed_packages", []).extend(name for name in missing if name not in tx.data.get("installed_packages", []))
@@ -258,7 +256,7 @@ def install(domain: str, secret: str, *, skip_dns: bool = False) -> int:
 
         maybe_fail("nginx")
         step("Nginx и cover website", "running")
-        generate_site(SITE_ROOT)
+        generate_site(SITE_ROOT, report.domain)
         tx.record_path(SITE_ROOT)
         write_nginx_config(report.domain, certificate=False, runner=runner, backup=tx.backup_file)
         tx.record_path(Path("/etc/nginx/sites-available/remnawave-node.conf"))
@@ -281,7 +279,7 @@ def install(domain: str, secret: str, *, skip_dns: bool = False) -> int:
 
         maybe_fail("health")
         step("Health checks", "running")
-        health = check_health(runner, node_port=node_port)
+        health = check_health(runner, node_port=node_port, domain=report.domain)
         tx.data["health_after_install"] = health
         tx.state.save(tx.data)
         if health.get("container") != "running":
@@ -300,7 +298,7 @@ def install(domain: str, secret: str, *, skip_dns: bool = False) -> int:
             step("Xray ждёт Config Profile из панели — это нормально до настройки узла", "warn")
         print("\nКоманды: remnawave-node status · doctor · repair · logs")
         return 0
-    except KeyboardInterrupt as exc:
+    except KeyboardInterrupt:
         if tx.data:
             rollback(tx, runner)
         error_box("прервано", "получен сигнал остановки", str(INSTALLER_LOG))
