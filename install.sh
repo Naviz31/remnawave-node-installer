@@ -5,8 +5,8 @@ REPO_OWNER="Naviz31"
 REPO_NAME="remnawave-node-installer"
 # Keep the remote bootstrap independent from a moving branch. Update both values
 # together when publishing a new installer source revision.
-REPO_REF="v1.0.5-source"
-REPO_SHA256="ff79715bbcb067cdad646352af2f2dc01701f8103091c735c962e120b4352eff"
+REPO_REF="v1.0.6-source"
+REPO_SHA256="33753d5cfbfe7623fde3a94a99f5c7083c45bafffdf119de826033f6b29a58bd"
 
 die() {
   printf '\033[31m[✗] %s\033[0m\n' "$1" >&2
