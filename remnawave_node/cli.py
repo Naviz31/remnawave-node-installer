@@ -13,8 +13,8 @@ from . import __version__
 from .compose import compose, read_node_config, write_node_config
 from .constants import APP_NAME, INSTALLER_DIR, INSTALLER_LOG, NODE_DIR, NODE_IMAGE, NODE_LOG_DIR, NODE_PORT, STATE_FILE
 from .errors import InstallerError
-from .firewall import apply_plan, build_iptables_plan, build_nft_plan, build_ufw_plan, detect_backend, find_nft_input_chain, iptables_ipv6_available, remove_managed_firewall
-from .health import check_health
+from .firewall import apply_plan, build_iptables_plan, build_nft_plan, build_ufw_plan, detect_backend, firewall_is_applied, find_nft_input_chain, iptables_ipv6_available, remove_managed_firewall
+from .health import check_health, require_install_health
 from .install import install, panel_ips_from_environment, restore_service_states
 from .logging_utils import configure_logger
 from .nginx import write_nginx_config
@@ -155,11 +155,46 @@ def doctor() -> int:
         "node port": health.get("node_port") == "listening",
         "xray listener": health.get("xray") == "listening" if xray_expected else health.get("xray") in {"listening", "waiting-for-panel-config"},
         "self-steal HTTPS": health.get("self_steal") == "ok" if xray_expected else health.get("self_steal") in {"ok", "not-checked"},
-        "firewall record": bool(state.get("created_firewall")),
+        "firewall rules": firewall_is_applied(state.get("created_firewall", []), runner, int(state.get("node_port", NODE_PORT))),
     }
     for label, passed in checks.items():
         step(label, "ok" if passed else "error" if label in {"self-steal HTTPS", "xray listener"} else "warn")
     return 0 if all(checks.values()) else 1
+
+
+def _nft_input_chain_from_state(identifiers):
+    for identifier in identifiers:
+        if not identifier.startswith("nft:") or identifier == "nft:remnawave_node":
+            continue
+        parts = identifier.split(":", 5)
+        if len(parts) == 6:
+            _, family, table, parent, _, _ = parts
+            if table != "remnawave_node":
+                return family, table, parent
+    return None
+
+
+def _build_firewall_plan(runner, backend, panel_ips, ssh_port, node_port, identifiers=None):
+    if backend == "ufw":
+        return build_ufw_plan(panel_ips, ssh_port, node_port)
+    if backend == "nftables":
+        owns_table = any(":remnawave_node:" in identifier for identifier in (identifiers or []))
+        if owns_table:
+            return build_nft_plan(panel_ips, ssh_port, node_port)
+        input_chain = _nft_input_chain_from_state(identifiers or []) or find_nft_input_chain(runner)
+        if not input_chain:
+            raise InstallerError("обнаружен nftables без inet input chain; firewall не изменён", stage="firewall")
+        return build_nft_plan(panel_ips, ssh_port, node_port, input_chain)
+    if backend == "iptables":
+        if not iptables_ipv6_available(runner):
+            raise InstallerError("для iptables необходимы iptables и ip6tables: IPv6 Node API нельзя безопасно закрыть", stage="firewall")
+        return build_iptables_plan(panel_ips, ssh_port, node_port)
+    return build_nft_plan(panel_ips, ssh_port, node_port)
+
+
+def _remember_firewall_item(items, item):
+    if item not in items:
+        items.append(item)
 
 
 def repair() -> int:
@@ -180,28 +215,59 @@ def repair() -> int:
         raise InstallerError("PANEL_IPS обязателен для repair: задайте IP панели в /etc/remnawave-node/config.env")
     node_port = int(state.get("node_port", NODE_PORT))
     backend = detect_backend(runner)
-    if backend == "iptables" and not iptables_ipv6_available(runner):
-        raise InstallerError("для iptables необходимы iptables и ip6tables: IPv6 Node API нельзя безопасно закрыть", stage="firewall")
-    remove_managed_firewall(state.get("created_firewall", []), runner, node_port)
     ssh_port = detect_ssh_port(runner)
-    if backend == "ufw":
-        plan = build_ufw_plan(panel_ips, ssh_port, node_port)
-    elif backend == "nftables":
-        input_chain = find_nft_input_chain(runner)
-        if not input_chain:
-            raise InstallerError("обнаружен nftables без inet input chain; firewall не изменён")
-        plan = build_nft_plan(panel_ips, ssh_port, node_port, input_chain)
-    elif backend == "iptables":
-        plan = build_iptables_plan(panel_ips, ssh_port, node_port)
-    else:
-        plan = build_nft_plan(panel_ips, ssh_port, node_port)
-    state["created_firewall"] = apply_plan(plan, runner)
+    old_identifiers = list(state.get("created_firewall", []))
+    old_backend = state.get("firewall_backend") or backend
+    old_panel_ips = state.get("panel_ips", panel_ips)
+    plan = _build_firewall_plan(runner, backend, panel_ips, ssh_port, node_port)
+    old_plan = _build_firewall_plan(runner, old_backend, old_panel_ips, ssh_port, node_port, old_identifiers) if old_identifiers else None
+    state["status"] = "repairing"
+    state["repair_previous_firewall"] = {
+        "created_firewall": old_identifiers,
+        "firewall_backend": old_backend,
+        "panel_ips": old_panel_ips,
+    }
+    state["created_firewall"] = []
+    StateStore().save(state)
+    remove_managed_firewall(old_identifiers, runner, node_port)
+    new_created = []
+
+    def record_new_firewall(item):
+        _remember_firewall_item(new_created, item)
+        state["created_firewall"] = list(new_created)
+        state["firewall_backend"] = plan.backend
+        StateStore().save(state)
+
+    try:
+        apply_plan(plan, runner, on_created=record_new_firewall)
+    except Exception as exc:
+        if new_created:
+            remove_managed_firewall(new_created, runner, node_port)
+        if old_plan is not None:
+            restored = []
+            try:
+                apply_plan(old_plan, runner, on_created=lambda item: _remember_firewall_item(restored, item))
+            except Exception as restore_exc:
+                state["status"] = "repair_failed"
+                StateStore().save(state)
+                raise InstallerError(f"repair firewall не применён, и прежний firewall не удалось восстановить: {restore_exc}", stage="firewall") from exc
+        state["created_firewall"] = old_identifiers
+        state["firewall_backend"] = old_backend
+        state["panel_ips"] = old_panel_ips
+        state.pop("repair_previous_firewall", None)
+        state["status"] = "installed"
+        StateStore().save(state)
+        raise InstallerError(f"repair firewall не применён; прежний firewall восстановлен: {exc}", stage="firewall") from exc
+    state["created_firewall"] = new_created
+    state["firewall_backend"] = plan.backend
     state["panel_ips"] = panel_ips
+    state.pop("repair_previous_firewall", None)
     health = check_health(runner, NODE_DIR, int(state.get("node_port", NODE_PORT)), state.get("domain"))
     if health.get("xray") == "listening" and health.get("self_steal") == "ok":
         state["xray_was_active"] = True
+    require_install_health(health, xray_was_active=bool(state.get("xray_was_active")))
     StateStore().save({**state, "health_after_repair": health, "status": "installed"})
-    return 0 if health.get("container") == "running" and health.get("nginx") == "valid" else 1
+    return 0
 
 
 def set_secret() -> int:
@@ -253,10 +319,7 @@ def update() -> int:
         compose(runner, NODE_DIR, "pull")
         compose(runner, NODE_DIR, "up", "-d")
         health = check_health(runner, NODE_DIR, int(state.get("node_port", NODE_PORT)), state.get("domain"))
-        if health.get("container") != "running":
-            raise InstallerError("новый контейнер не подтвердил состояние running")
-        if health.get("self_steal") == "failed":
-            raise InstallerError("новый контейнер запущен, но внешний Self-Steal HTTPS health check не прошёл")
+        require_install_health(health, xray_was_active=bool(state.get("xray_was_active")))
     except Exception:
         step("Обновление не прошло; возвращаю предыдущий образ", "warn")
         compose(runner, NODE_DIR, "down", check=False)

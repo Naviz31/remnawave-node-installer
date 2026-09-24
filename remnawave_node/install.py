@@ -18,7 +18,7 @@ from .constants import (
 )
 from .errors import InstallerError
 from .firewall import apply_plan, build_iptables_plan, build_nft_plan, build_ufw_plan, detect_backend, find_nft_input_chain, iptables_ipv6_available
-from .health import check_health
+from .health import check_health, require_install_health
 from .logging_utils import configure_logger
 from .nginx import write_nginx_config
 from .preflight import run_preflight
@@ -275,7 +275,8 @@ def install(domain: str, secret: str, *, skip_dns: bool = False) -> int:
         cert_created = issue_certificate(report.domain, runner)
         tx.data["certificate_created"] = cert_created
         write_nginx_config(report.domain, certificate=True, runner=runner)
-        install_renewal_hook(report.domain, runner, on_created=tx.record_path)
+        if not install_renewal_hook(report.domain, runner, on_created=tx.record_path):
+            step("certbot renew --dry-run не прошёл; renewal hook установлен, продолжайте с проверкой сертификата", "warn")
         step("TLS certificate", "ok")
 
         maybe_fail("logs")
@@ -290,8 +291,7 @@ def install(domain: str, secret: str, *, skip_dns: bool = False) -> int:
         if health.get("xray") == "listening" and health.get("self_steal") == "ok":
             tx.data["xray_was_active"] = True
         tx.state.save(tx.data)
-        if health.get("container") != "running":
-            raise InstallerError("контейнер remnanode не подтверждён как running", stage="health", hint="проверьте docker compose logs")
+        require_install_health(health)
         step("Health checks", "ok")
         tx.commit()
 

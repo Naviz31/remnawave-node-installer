@@ -4,6 +4,7 @@ from typing import Dict, Optional
 
 from .compose import compose
 from .constants import COVER_SOCKET, NODE_CONTAINER, NODE_DIR, NODE_PORT
+from .errors import InstallerError
 from .system import CommandRunner, port_listeners
 
 
@@ -44,3 +45,18 @@ def check_health(
     nginx = runner.run(["nginx", "-t"], check=False, timeout=30)
     result["nginx"] = "valid" if nginx.returncode == 0 else "invalid"
     return result
+
+
+def require_install_health(health: Dict[str, str], *, xray_was_active: bool = False) -> None:
+    """Reject a successful install/update when its required runtime path is not healthy."""
+    required = {
+        "container": "running",
+        "node_port": "listening",
+        "nginx": "valid",
+        "cover_backend": "listening",
+    }
+    if xray_was_active or health.get("xray") == "listening":
+        required.update({"xray": "listening", "self_steal": "ok"})
+    missing = [name for name, expected in required.items() if health.get(name) != expected]
+    if missing:
+        raise InstallerError(f"финальная health-проверка не пройдена: {', '.join(missing)}", stage="health")

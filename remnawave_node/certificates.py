@@ -23,7 +23,7 @@ def issue_certificate(domain: str, runner: CommandRunner) -> bool:
     return True
 
 
-def install_renewal_hook(domain: str, runner: CommandRunner, on_created: Optional[Callable[[Path], None]] = None) -> None:
+def install_renewal_hook(domain: str, runner: CommandRunner, on_created: Optional[Callable[[Path], None]] = None) -> bool:
     hook = Path("/etc/letsencrypt/renewal-hooks/deploy/remnawave-node-reload")
     existed = hook.exists()
     hook.parent.mkdir(parents=True, exist_ok=True)
@@ -31,4 +31,8 @@ def install_renewal_hook(domain: str, runner: CommandRunner, on_created: Optiona
     if not existed and on_created:
         on_created(hook)
     hook.chmod(0o755)
-    runner.run(["certbot", "renew", "--dry-run"], timeout=300)
+    try:
+        result = runner.run(["certbot", "renew", "--dry-run", "--non-interactive"], check=False, timeout=300)
+    except InstallerError:
+        return False
+    return result.returncode == 0

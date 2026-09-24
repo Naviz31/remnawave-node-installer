@@ -178,6 +178,54 @@ def _ufw_rule_present(current: str, port: str, source: str) -> bool:
     return False
 
 
+def firewall_is_applied(identifiers: List[str], runner: CommandRunner, node_port: int = NODE_PORT) -> bool:
+    """Verify managed firewall resources still exist without changing firewall state."""
+    if not identifiers:
+        return False
+    ufw_status = None
+    iptables_cache = {}
+    nft_cache = {}
+    for identifier in identifiers:
+        if identifier.startswith("ufw:"):
+            if ufw_status is None:
+                ufw_status = runner.run(["ufw", "status"], check=False, timeout=15).stdout
+            if identifier.startswith("ufw:base:"):
+                port = identifier.rsplit(":", 1)[1]
+                source = ""
+            else:
+                source, port = identifier[4:].rsplit(":", 1)
+            if not _ufw_rule_present(ufw_status, port, source):
+                return False
+        elif identifier.startswith(("iptables:", "ip6tables:")):
+            parts = identifier.split(":")
+            if len(parts) == 2:
+                tool, chain, port = parts[0], parts[1], str(node_port)
+            else:
+                tool, chain, port = parts
+            chain_rules = iptables_cache.setdefault((tool, chain), runner.run([tool, "-S", chain], check=False, timeout=15))
+            input_rules = iptables_cache.setdefault((tool, "INPUT"), runner.run([tool, "-S", "INPUT"], check=False, timeout=15))
+            jump_present = any(
+                (fields[:2] == ["-A", "INPUT"] and "-p" in fields and fields[fields.index("-p") + 1] == "tcp"
+                 and "--dport" in fields and fields[fields.index("--dport") + 1] == port
+                 and "-j" in fields and fields[fields.index("-j") + 1] == chain)
+                for fields in (line.split() for line in input_rules.stdout.splitlines())
+            )
+            if chain_rules.returncode != 0 or not jump_present:
+                return False
+        elif identifier.startswith("nft:"):
+            if identifier == "nft:remnawave_node":
+                result = runner.run(["nft", "list", "table", "inet", "remnawave_node"], check=False, timeout=15)
+                if result.returncode != 0:
+                    return False
+                continue
+            _, family, table, parent, chain, port = identifier.split(":", 5)
+            chain_result = nft_cache.setdefault((family, table, chain), runner.run(["nft", "list", "chain", family, table, chain], check=False, timeout=15))
+            parent_result = nft_cache.setdefault((family, table, parent), runner.run(["nft", "-a", "list", "chain", family, table, parent], check=False, timeout=15))
+            if chain_result.returncode != 0 or not any(f"dport {port}" in line and f"jump {chain}" in line for line in parent_result.stdout.splitlines()):
+                return False
+    return True
+
+
 def _remove_nft_rule(family: str, table: str, parent: str, target_chain: str, node_port: str, runner: CommandRunner) -> None:
     rules = runner.run(["nft", "-a", "list", "chain", family, table, parent], check=False, timeout=30)
     for line in rules.stdout.splitlines():
@@ -227,8 +275,9 @@ def remove_managed_firewall(identifiers: List[str], runner: CommandRunner, node_
             runner.run([tool, "-D", "INPUT", "-p", "tcp", "--dport", rule_port, "-j", chain], check=False, timeout=30)
             runner.run([tool, "-X", chain], check=False, timeout=30)
         elif identifier.startswith("ufw:"):
-            _, kind, value = identifier.split(":", 2)
-            if kind == "base":
-                runner.run(["ufw", "delete", "allow", f"{value}/tcp"], check=False, timeout=30)
-            elif kind:
-                runner.run(["ufw", "delete", "allow", "from", kind, "to", "any", "port", value or str(node_port), "proto", "tcp"], check=False, timeout=30)
+            if identifier.startswith("ufw:base:"):
+                port = identifier.rsplit(":", 1)[1]
+                runner.run(["ufw", "delete", "allow", f"{port}/tcp"], check=False, timeout=30)
+            else:
+                source, port = identifier[4:].rsplit(":", 1)
+                runner.run(["ufw", "delete", "allow", "from", source, "to", "any", "port", port or str(node_port), "proto", "tcp"], check=False, timeout=30)

@@ -29,6 +29,8 @@ printf 'PANEL_IPS=203.0.113.10,2001:db8::10\n' | sudo tee /etc/remnawave-node/co
 sudo remnawave-node repair
 ```
 
+Bootstrap загружает исходный код не с плавающего `main`: внутри `install.sh` зафиксированы commit и SHA-256 архива. При выпуске новой версии обновляются обе контрольные величины.
+
 Если не хотите сохранять конфиг, допустим одноразовый запуск одной командой: `curl -fsSL https://raw.githubusercontent.com/Naviz31/remnawave-node-installer/main/install.sh | sudo env PANEL_IPS="203.0.113.10" bash`. Установщик всё равно спросит домен и ключ.
 
 > ⚠️ Для выпуска сертификата A-запись домена должна указывать на публичный IPv4 этого VPS. Проверка DNS включена по умолчанию.

@@ -1,6 +1,6 @@
 import unittest
 
-from remnawave_node.firewall import apply_plan, build_iptables_plan, build_nft_plan, build_ufw_plan, detect_backend
+from remnawave_node.firewall import apply_plan, build_iptables_plan, build_nft_plan, build_ufw_plan, detect_backend, firewall_is_applied, remove_managed_firewall
 from remnawave_node.system import CommandResult
 
 
@@ -18,6 +18,14 @@ class UfwStatusRunner(FakeRunner):
         self.commands.append(args)
         if args == ["ufw", "status"]:
             return CommandResult(0, "Status: active\n8080/tcp ALLOW IN Anywhere\n2222/tcp ALLOW IN 203.0.113.10\n")
+        return CommandResult(0, "")
+
+
+class AppliedUfwRunner(FakeRunner):
+    def run(self, args, **kwargs):
+        self.commands.append(args)
+        if args == ["ufw", "status"]:
+            return CommandResult(0, "Status: active\n80/tcp ALLOW IN Anywhere\n443/tcp ALLOW IN Anywhere\n2222/tcp ALLOW IN 203.0.113.10\n")
         return CommandResult(0, "")
 
 
@@ -87,6 +95,16 @@ class FirewallTests(unittest.TestCase):
         runner = FakeRunner()
         created = apply_plan(build_ufw_plan(["203.0.113.10"], 22), runner)
         self.assertIn("ufw:203.0.113.10:2222", created)
+
+    def test_ufw_ipv6_source_rollback_keeps_address_intact(self):
+        runner = FakeRunner()
+        remove_managed_firewall(["ufw:2001:db8::10:2222"], runner)
+        self.assertIn(["ufw", "delete", "allow", "from", "2001:db8::10", "to", "any", "port", "2222", "proto", "tcp"], runner.commands)
+
+    def test_doctor_can_verify_actual_ufw_rules(self):
+        runner = AppliedUfwRunner()
+        identifiers = ["ufw:base:80", "ufw:base:443", "ufw:203.0.113.10:2222"]
+        self.assertTrue(firewall_is_applied(identifiers, runner))
 
     def test_ufw_matching_does_not_treat_8080_as_port_80(self):
         runner = UfwStatusRunner()

@@ -3,7 +3,10 @@ set -Eeuo pipefail
 
 REPO_OWNER="Naviz31"
 REPO_NAME="remnawave-node-installer"
-REPO_REF="main"
+# Keep the remote bootstrap independent from a moving branch. Update both values
+# together when publishing a new installer source revision.
+REPO_REF="9e71806ea02de0719876c6b86dfa365e0ac89e84"
+REPO_SHA256="23f5cb6ac7defbcd1cc2363d74992c3844d8f502889fafdfe490f55863c0eae8"
 
 die() {
   printf '\033[31m[✗] %s\033[0m\n' "$1" >&2
@@ -37,7 +40,10 @@ if [[ -z "$SCRIPT_DIR" ]]; then
   cleanup() { rm -rf -- "$temp_dir"; }
   trap cleanup EXIT
   archive="$temp_dir/source.tar.gz"
-  curl -fsSL "https://github.com/${REPO_OWNER}/${REPO_NAME}/archive/refs/heads/${REPO_REF}.tar.gz" -o "$archive"
+  command -v sha256sum >/dev/null 2>&1 || die "Не найден sha256sum для проверки bootstrap-архива"
+  curl -fsSL "https://github.com/${REPO_OWNER}/${REPO_NAME}/archive/${REPO_REF}.tar.gz" -o "$archive"
+  actual_sha256="$(sha256sum "$archive" | awk '{print $1}')"
+  [[ "$actual_sha256" == "$REPO_SHA256" ]] || die "Контрольная сумма bootstrap-архива не совпала"
   tar -xzf "$archive" -C "$temp_dir"
   SCRIPT_DIR="$(find "$temp_dir" -mindepth 1 -maxdepth 1 -type d -name "${REPO_NAME}-*" -print -quit)"
   [[ -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/remnawave_node/cli.py" ]] || die "Не удалось распаковать исходный код установщика"
