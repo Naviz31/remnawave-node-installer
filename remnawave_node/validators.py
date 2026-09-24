@@ -1,7 +1,10 @@
+import json
 import ipaddress
 import re
 import socket
 from typing import List, Optional, Tuple
+
+from .errors import InstallerError
 
 
 DOMAIN_RE = re.compile(r"^(?=.{1,253}\Z)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}\Z")
@@ -35,8 +38,9 @@ def parse_ips(raw: str) -> List[str]:
 def resolve_domain(domain: str) -> Tuple[List[str], List[str]]:
     ipv4 = set()
     ipv6 = set()
+    fqdn = domain.rstrip(".") + "."
     try:
-        records = socket.getaddrinfo(domain, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        records = socket.getaddrinfo(fqdn, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
     except socket.gaierror:
         return [], []
     for family, _, _, _, sockaddr in records:
@@ -47,8 +51,37 @@ def resolve_domain(domain: str) -> Tuple[List[str], List[str]]:
     return sorted(ipv4), sorted(ipv6)
 
 
-def domain_points_to(domain: str, public_ipv4: Optional[str], public_ipv6: Optional[str] = None) -> Tuple[bool, str]:
+def _resolve_public_dns(domain: str, runner, record_type: int) -> List[str]:
+    if runner is None:
+        return []
+    encoded_domain = domain.rstrip(".")
+    addresses = set()
+    for endpoint in ("https://cloudflare-dns.com/dns-query", "https://dns.google/resolve"):
+        url = f"{endpoint}?name={encoded_domain}&type={record_type}"
+        try:
+            result = runner.run(
+                ["curl", "-fsS", "--max-time", "5", "-H", "accept: application/dns-json", url],
+                check=False,
+                timeout=8,
+            )
+            payload = json.loads(result.stdout) if result.returncode == 0 else {}
+        except (InstallerError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        for answer in payload.get("Answer", []):
+            if answer.get("type") != record_type:
+                continue
+            try:
+                address = ipaddress.ip_address(answer.get("data", ""))
+            except ValueError:
+                continue
+            addresses.add(str(address))
+    return sorted(addresses)
+
+
+def domain_points_to(domain: str, public_ipv4: Optional[str], public_ipv6: Optional[str] = None, runner=None) -> Tuple[bool, str]:
     ipv4, ipv6 = resolve_domain(domain)
+    ipv4 = sorted(set(ipv4) | set(_resolve_public_dns(domain, runner, 1)))
+    ipv6 = sorted(set(ipv6) | set(_resolve_public_dns(domain, runner, 28)))
     if public_ipv4 and ipv4 and public_ipv4 not in ipv4:
         return False, f"A-запись не совпадает: ожидается {public_ipv4}, получено {', '.join(ipv4)}"
     if public_ipv4 and not ipv4:

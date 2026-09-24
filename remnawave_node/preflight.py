@@ -50,7 +50,7 @@ def run_preflight(domain: str, *, runner: CommandRunner, skip_dns: bool = False,
     report.public_ipv4 = public_ip(runner, 4)
     report.public_ipv6 = public_ip(runner, 6)
     if not skip_dns:
-        ok, message = domain_points_to(domain, report.public_ipv4, report.public_ipv6)
+        ok, message = domain_points_to(domain, report.public_ipv4, report.public_ipv6, runner=runner)
         if not ok:
             expected = report.public_ipv4 or "публичный IP"
             raise PreflightError(f"DNS-проверка не пройдена: {message}; ожидается {expected}. Используйте --skip-dns-check только осознанно", stage="preflight")
