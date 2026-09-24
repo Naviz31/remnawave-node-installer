@@ -18,7 +18,7 @@ from .constants import (
     RENEWAL_HOOK,
 )
 from .errors import InstallerError
-from .firewall import apply_plan, build_iptables_plan, build_nft_plan, build_ufw_plan, detect_backend, find_nft_input_chain
+from .firewall import apply_plan, build_iptables_plan, build_nft_plan, build_ufw_plan, detect_backend, find_nft_input_chain, iptables_ipv6_available
 from .health import check_health
 from .logging_utils import configure_logger
 from .nginx import write_nginx_config
@@ -59,7 +59,7 @@ def node_port_from_environment() -> int:
 
 
 def install_packages(runner: CommandRunner, tx: InstallTransaction) -> None:
-    packages = ["ca-certificates", "curl", "dnsutils", "fail2ban", "logrotate", "nginx", "certbot", "iproute2", "nftables"]
+    packages = ["ca-certificates", "curl", "dnsutils", "fail2ban", "logrotate", "nginx", "certbot", "iproute2", "iptables", "nftables"]
     missing = [name for name in packages if not package_installed(name)]
     if missing:
         tx.data.setdefault("installed_packages", []).extend(name for name in missing if name not in tx.data.get("installed_packages", []))
@@ -126,6 +126,19 @@ def maybe_fail(stage: str) -> None:
         raise InstallerError(f"тестовая ошибка на этапе {stage}", stage=stage)
 
 
+def restore_service_states(runner: CommandRunner, snapshots: dict) -> None:
+    """Restore enablement/activity and reload an originally active Nginx."""
+    for service, snapshot in snapshots.items():
+        if snapshot.get("enabled"):
+            runner.run(["systemctl", "enable", service], check=False, timeout=30)
+        else:
+            runner.run(["systemctl", "disable", service], check=False, timeout=30)
+        runner.run(["systemctl", "start" if snapshot.get("active") else "stop", service], check=False, timeout=30)
+    nginx = snapshots.get("nginx", {})
+    if nginx.get("active"):
+        runner.run(["systemctl", "reload", "nginx"], check=False, timeout=30)
+
+
 def rollback(tx: InstallTransaction, runner: CommandRunner) -> None:
     errors = []
     try:
@@ -151,13 +164,7 @@ def rollback(tx: InstallTransaction, runner: CommandRunner) -> None:
     except Exception as exc:
         errors.append(str(exc))
     try:
-        before_services = tx.data.get("services_before", {})
-        for service, snapshot in before_services.items():
-            if snapshot.get("enabled"):
-                runner.run(["systemctl", "enable", service], check=False, timeout=30)
-            else:
-                runner.run(["systemctl", "disable", service], check=False, timeout=30)
-            runner.run(["systemctl", "start" if snapshot.get("active") else "stop", service], check=False, timeout=30)
+        restore_service_states(runner, tx.data.get("services_before", {}))
         packages = list(dict.fromkeys(tx.data.get("installed_packages", []) + tx.data.get("docker_packages", [])))
         if packages:
             runner.run(["apt-get", "remove", "-y", "--purge", *packages], check=False, timeout=900)
@@ -232,6 +239,8 @@ def install(domain: str, secret: str, *, skip_dns: bool = False) -> int:
                 raise InstallerError("обнаружен nftables без inet input chain; firewall не изменён, настройте правило Node API вручную", stage="firewall")
             plan = build_nft_plan(panel_ips, ssh_port, node_port, input_chain)
         elif backend == "iptables":
+            if not iptables_ipv6_available(runner):
+                raise InstallerError("для iptables необходимы iptables и ip6tables: IPv6 Node API нельзя безопасно закрыть", stage="firewall")
             plan = build_iptables_plan(panel_ips, ssh_port, node_port)
         else:
             plan = build_nft_plan(panel_ips, ssh_port, node_port)

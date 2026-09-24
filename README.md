@@ -97,8 +97,9 @@ Logrotate → Health checks → install-state.json
 ## 🔐 Firewall и SSH
 
 - существующая UFW не сбрасывается и не заменяется;
+- при активной UFW установщик не добавляет широкое правило SSH: существующие ограничения доступа к SSH сохраняются;
 - native nftables выбирается только при наличии подходящей существующей `inet input` chain; Docker `iptables-nft` сам по себе не переключает установщик на nftables;
-- при iptables создаётся отдельная цепочка `REMNAWAVE_NODE`;
+- при iptables создаются отдельные IPv4/IPv6 цепочки `REMNAWAVE_NODE` и `REMNAWAVE_NODE6`;
 - iptables-jump матчится только на `NODE_PORT`, поэтому правила SSH/HTTP/HTTPS администратора не обходятся;
 - `NODE_PORT` не открывается всему интернету;
 - Self-Steal socket принимает PROXY protocol v1 (`xver: 1`) через `proxy_protocol`;
@@ -114,7 +115,7 @@ Logrotate → Health checks → install-state.json
 | `remnawave-node status` | короткий dashboard состояния |
 | `remnawave-node doctor` | расширенная диагностика и рекомендации |
 | `remnawave-node repair` | восстановление управляемых файлов и контейнера |
-| `remnawave-node update` | выбор последнего стабильного semver-тега Docker Hub, pull и rollback при ошибке |
+| `remnawave-node update` | выбор последнего стабильного semver-тега Docker Hub в текущей major-линейке, pull и rollback при ошибке |
 | `remnawave-node set-secret` | скрытая смена `SECRET_KEY` с возвратом при ошибке |
 | `remnawave-node logs` | последние логи контейнера в режиме follow |
 | `remnawave-node uninstall` | удаление только ресурсов из manifest |

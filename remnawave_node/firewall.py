@@ -43,7 +43,6 @@ def build_ufw_plan(panel_ips: List[str], ssh_port: int, node_port: int = NODE_PO
     ips = _validate_panel_ips(panel_ips)
     plan = FirewallPlan("ufw")
     plan.commands.extend([
-        ["ufw", "allow", f"{ssh_port}/tcp", "comment", "remnawave-node ssh"],
         ["ufw", "allow", "80/tcp", "comment", "remnawave-node http"],
         ["ufw", "allow", "443/tcp", "comment", "remnawave-node https"],
     ])
@@ -52,7 +51,7 @@ def build_ufw_plan(panel_ips: List[str], ssh_port: int, node_port: int = NODE_PO
         plan.identifiers.append(f"ufw:{ip}:{node_port}")
     if not ips:
         plan.warnings.append("PANEL_IPS не задан: NODE_PORT останется закрыт, пока вы не добавите IP панели")
-    plan.identifiers.extend([f"ufw:base:{ssh_port}", "ufw:base:80", "ufw:base:443"])
+    plan.identifiers.extend(["ufw:base:80", "ufw:base:443"])
     return plan
 
 
@@ -101,24 +100,34 @@ def build_nft_plan(panel_ips: List[str], ssh_port: int, node_port: int = NODE_PO
 
 
 def build_iptables_plan(panel_ips: List[str], ssh_port: int, node_port: int = NODE_PORT) -> FirewallPlan:
-    """Create a narrowly scoped INPUT jump for Node API only."""
+    """Create narrowly scoped IPv4 and IPv6 INPUT jumps for Node API only."""
     ips = _validate_panel_ips(panel_ips)
-    chain = "REMNAWAVE_NODE"
     plan = FirewallPlan("iptables")
-    plan.commands = [
-        ["iptables", "-N", chain],
-        ["iptables", "-I", "INPUT", "1", "-p", "tcp", "--dport", str(node_port), "-j", chain],
-    ]
-    for ip in ips:
-        plan.commands.append(["iptables", "-A", chain, "-p", "tcp", "-s", ip, "--dport", str(node_port), "-j", "ACCEPT"])
-    plan.commands.extend([
-        ["iptables", "-A", chain, "-p", "tcp", "--dport", str(node_port), "-j", "DROP"],
-        ["iptables", "-A", chain, "-j", "RETURN"],
-    ])
-    plan.identifiers = [f"iptables:{chain}:{node_port}"]
+    plan.commands = []
+    plan.identifiers = []
+    for tool, chain, family_ips, identifier_prefix in (
+        ("iptables", "REMNAWAVE_NODE", [ip for ip in ips if ":" not in ip], "iptables"),
+        ("ip6tables", "REMNAWAVE_NODE6", [ip for ip in ips if ":" in ip], "ip6tables"),
+    ):
+        plan.commands.extend([
+            [tool, "-N", chain],
+            [tool, "-I", "INPUT", "1", "-p", "tcp", "--dport", str(node_port), "-j", chain],
+        ])
+        for ip in family_ips:
+            plan.commands.append([tool, "-A", chain, "-p", "tcp", "-s", ip, "--dport", str(node_port), "-j", "ACCEPT"])
+        plan.commands.extend([
+            [tool, "-A", chain, "-p", "tcp", "--dport", str(node_port), "-j", "DROP"],
+            [tool, "-A", chain, "-j", "RETURN"],
+        ])
+        plan.identifiers.append(f"{identifier_prefix}:{chain}:{node_port}")
     if not ips:
         plan.warnings.append("PANEL_IPS не задан: NODE_PORT останется закрыт, пока вы не добавите IP панели")
     return plan
+
+
+def iptables_ipv6_available(runner: CommandRunner) -> bool:
+    """Both families must be available before changing the iptables backend."""
+    return runner.exists("iptables") and runner.exists("ip6tables")
 
 
 def apply_plan(plan: FirewallPlan, runner: CommandRunner) -> List[str]:
@@ -188,14 +197,25 @@ def remove_managed_firewall(identifiers: List[str], runner: CommandRunner, node_
             if table == "remnawave_node":
                 runner.run(["nft", "delete", "table", family, table], check=False, timeout=30)
         elif identifier.startswith("iptables:REMNAWAVE_NODE:"):
+            tool = "iptables"
             _, chain, rule_port = identifier.split(":", 2)
-            rules = runner.run(["iptables", "-S", chain], check=False, timeout=30)
+            rules = runner.run([tool, "-S", chain], check=False, timeout=30)
             for line in reversed(rules.stdout.splitlines()):
                 fields = line.split()
                 if fields and fields[0] == "-A":
-                    runner.run(["iptables", "-D", *fields[1:]], check=False, timeout=30)
-            runner.run(["iptables", "-D", "INPUT", "-p", "tcp", "--dport", rule_port, "-j", chain], check=False, timeout=30)
-            runner.run(["iptables", "-X", chain], check=False, timeout=30)
+                    runner.run([tool, "-D", *fields[1:]], check=False, timeout=30)
+            runner.run([tool, "-D", "INPUT", "-p", "tcp", "--dport", rule_port, "-j", chain], check=False, timeout=30)
+            runner.run([tool, "-X", chain], check=False, timeout=30)
+        elif identifier.startswith("ip6tables:REMNAWAVE_NODE6:"):
+            tool = "ip6tables"
+            _, chain, rule_port = identifier.split(":", 2)
+            rules = runner.run([tool, "-S", chain], check=False, timeout=30)
+            for line in reversed(rules.stdout.splitlines()):
+                fields = line.split()
+                if fields and fields[0] == "-A":
+                    runner.run([tool, "-D", *fields[1:]], check=False, timeout=30)
+            runner.run([tool, "-D", "INPUT", "-p", "tcp", "--dport", rule_port, "-j", chain], check=False, timeout=30)
+            runner.run([tool, "-X", chain], check=False, timeout=30)
         elif identifier.startswith("ufw:"):
             _, kind, value = identifier.split(":", 2)
             if kind == "base":

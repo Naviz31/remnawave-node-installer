@@ -13,9 +13,9 @@ from . import __version__
 from .compose import compose, read_node_config, write_node_config
 from .constants import APP_NAME, INSTALLER_DIR, INSTALLER_LOG, NODE_DIR, NODE_IMAGE, NODE_LOG_DIR, NODE_PORT, STATE_FILE
 from .errors import InstallerError
-from .firewall import apply_plan, build_iptables_plan, build_nft_plan, build_ufw_plan, detect_backend, find_nft_input_chain, remove_managed_firewall
+from .firewall import apply_plan, build_iptables_plan, build_nft_plan, build_ufw_plan, detect_backend, find_nft_input_chain, iptables_ipv6_available, remove_managed_firewall
 from .health import check_health
-from .install import install, panel_ips_from_environment
+from .install import install, panel_ips_from_environment, restore_service_states
 from .logging_utils import configure_logger
 from .nginx import write_nginx_config
 from .security import env_line, read_env_file, write_private
@@ -109,8 +109,13 @@ def latest_node_image(runner: CommandRunner, current_image: str) -> str:
         match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", tag)
         if match:
             versions.append((tuple(int(part) for part in match.groups()), tag))
+    current_tag = current_image.rsplit(":", 1)[-1]
+    current_match = re.fullmatch(r"(\d+)\.\d+\.\d+", current_tag)
+    if current_match:
+        current_major = int(current_match.group(1))
+        versions = [item for item in versions if item[0][0] == current_major]
     if not versions:
-        raise InstallerError("на Docker Hub не найдены стабильные semver-теги Node", stage="update")
+        raise InstallerError("на Docker Hub не найдены стабильные semver-теги Node в текущей major-линейке", stage="update")
     return f"{repository}:{max(versions)[1]}"
 
 
@@ -169,8 +174,10 @@ def repair() -> int:
     if not panel_ips:
         raise InstallerError("PANEL_IPS обязателен для repair: задайте IP панели в /etc/remnawave-node/config.env")
     node_port = int(state.get("node_port", NODE_PORT))
-    remove_managed_firewall(state.get("created_firewall", []), runner, int(state.get("node_port", NODE_PORT)))
     backend = detect_backend(runner)
+    if backend == "iptables" and not iptables_ipv6_available(runner):
+        raise InstallerError("для iptables необходимы iptables и ip6tables: IPv6 Node API нельзя безопасно закрыть", stage="firewall")
+    remove_managed_firewall(state.get("created_firewall", []), runner, node_port)
     ssh_port = detect_ssh_port(runner)
     if backend == "ufw":
         plan = build_ufw_plan(panel_ips, ssh_port, node_port)
@@ -284,6 +291,7 @@ def uninstall(confirmed: bool) -> int:
             path.unlink(missing_ok=True)
         elif path.is_dir():
             shutil.rmtree(path, ignore_errors=True) if path in (SITE_ROOT, INSTALLER_DIR, NODE_LOG_DIR) else path.rmdir()
+    restore_service_states(runner, state.get("services_before", {}))
     if state.get("certificate_created") and state.get("domain"):
         runner.run(["certbot", "delete", "--cert-name", state["domain"], "--non-interactive"], check=False, timeout=120)
     owned_packages = list(dict.fromkeys(state.get("installed_packages", []) + state.get("docker_packages", [])))

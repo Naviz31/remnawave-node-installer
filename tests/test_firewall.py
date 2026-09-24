@@ -50,11 +50,19 @@ class FirewallTests(unittest.TestCase):
             self.assertNotIn("-F", flattened)
 
     def test_iptables_does_not_accept_unrelated_ports(self):
-        plan = build_iptables_plan(["203.0.113.10"], 22)
+        plan = build_iptables_plan(["203.0.113.10", "2001:db8::10"], 22)
         commands = [" ".join(command) for command in plan.commands]
         self.assertTrue(any("--dport 2222 -j ACCEPT" in command for command in commands))
         self.assertFalse(any("--dport 22 " in command or "80,443" in command for command in commands))
-        self.assertEqual(plan.identifiers, ["iptables:REMNAWAVE_NODE:2222"])
+        self.assertTrue(any(command.startswith("ip6tables ") and "2001:db8::10" in command for command in commands))
+        self.assertFalse(any(command.startswith("iptables ") and "2001:db8::10" in command for command in commands))
+        self.assertEqual(plan.identifiers, ["iptables:REMNAWAVE_NODE:2222", "ip6tables:REMNAWAVE_NODE6:2222"])
+
+    def test_ufw_does_not_open_ssh(self):
+        plan = build_ufw_plan(["203.0.113.10"], 22)
+        commands = [" ".join(command) for command in plan.commands]
+        self.assertFalse(any("ssh" in command or "22/tcp" in command for command in commands))
+        self.assertNotIn("ufw:base:22", plan.identifiers)
 
     def test_ufw_source_rule_has_correct_rollback_identifier(self):
         runner = FakeRunner()
