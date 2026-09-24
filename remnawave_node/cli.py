@@ -1,5 +1,4 @@
 import argparse
-import getpass
 import json
 import os
 import re
@@ -37,46 +36,17 @@ def _read_interactive(prompt: str, *, secret: bool = False) -> str:
     # Python. Re-opening the device as a seekable ``r+`` stream is not
     # portable: Python 3.14 can reject character devices with
     # ``io.UnsupportedOperation: File or stream is not seekable``.
+    # Use normal line input for the key as well. This keeps paste handling in
+    # the terminal and shows the pasted value so users can verify it arrived.
     if sys.stdin.isatty():
-        if secret:
-            return _read_secret_line(sys.stdin, prompt)
         return input(prompt).strip()
 
     tty_path = Path("/dev/tty")
     if tty_path.exists():
-        if secret:
-            with tty_path.open("r", encoding="utf-8", errors="replace") as tty:
-                return _read_secret_line(tty, prompt)
         with tty_path.open("r", encoding="utf-8", errors="replace") as tty:
             print(prompt, end="", file=sys.stderr, flush=True)
             return tty.readline().strip()
-    return getpass.getpass(prompt) if secret else input(prompt).strip()
-
-
-def _read_secret_line(stream, prompt: str) -> str:
-    """Read a hidden line while keeping the terminal's normal paste handling."""
-    try:
-        import termios
-    except ImportError:
-        return getpass.getpass(prompt)
-
-    try:
-        fd = stream.fileno()
-        original = termios.tcgetattr(fd)
-    except (AttributeError, OSError, termios.error):
-        # Non-terminal streams and platforms without termios still need the
-        # portable getpass fallback.
-        return getpass.getpass(prompt)
-
-    hidden = list(original)
-    hidden[3] &= ~termios.ECHO
-    termios.tcsetattr(fd, termios.TCSANOW, hidden)
-    try:
-        print(prompt, end="", file=sys.stderr, flush=True)
-        return stream.readline().rstrip("\r\n")
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, original)
-        print(file=sys.stderr, flush=True)
+    return input(prompt).strip()
 
 
 def _parser() -> argparse.ArgumentParser:

@@ -19,12 +19,12 @@ IP панели задаётся до запуска в серверном ко�
 sudo install -d -m 0755 /etc/remnawave-node
 printf 'PANEL_IPS=203.0.113.10\n' | sudo tee /etc/remnawave-node/config.env >/dev/null
 sudo chmod 0644 /etc/remnawave-node/config.env
-curl -fsSL https://raw.githubusercontent.com/Naviz31/remnawave-node-installer/v1.0.5/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/Naviz31/remnawave-node-installer/v1.0.6/install.sh | sudo bash
 ```
 
 После этого установщик интерактивно запросит только домен и ключ ноды. Для нескольких адресов используйте запятую:
 
-Ключ вводится скрыто построчно, поэтому его можно вставить из буфера обмена через обычную комбинацию вставки вашего терминала, включая `Ctrl+V` в терминалах, где эта комбинация назначена на вставку.
+Ключ вводится обычной строкой и отображается на экране, поэтому после вставки из буфера обмена его значение видно сразу.
 
 ```bash
 printf 'PANEL_IPS=203.0.113.10,2001:db8::10\n' | sudo tee /etc/remnawave-node/config.env >/dev/null
@@ -33,7 +33,7 @@ sudo remnawave-node repair
 
 Bootstrap загружает исходный код не с плавающего `main`: внутри `install.sh` зафиксированы commit и SHA-256 архива. При выпуске новой версии обновляются обе контрольные величины.
 
-Если не хотите сохранять конфиг, допустим одноразовый запуск одной командой: `curl -fsSL https://raw.githubusercontent.com/Naviz31/remnawave-node-installer/v1.0.5/install.sh | sudo env PANEL_IPS="203.0.113.10" bash`. Установщик всё равно спросит домен и ключ.
+Если не хотите сохранять конфиг, допустим одноразовый запуск одной командой: `curl -fsSL https://raw.githubusercontent.com/Naviz31/remnawave-node-installer/v1.0.6/install.sh | sudo env PANEL_IPS="203.0.113.10" bash`. Установщик всё равно спросит домен и ключ.
 
 > ⚠️ Для выпуска сертификата A-запись домена должна указывать на публичный IPv4 этого VPS. Проверка DNS включена по умолчанию.
 
