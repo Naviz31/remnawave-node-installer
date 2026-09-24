@@ -1,3 +1,4 @@
+import ipaddress
 import os
 import platform
 import shutil
@@ -95,6 +96,49 @@ def port_listeners(runner: CommandRunner) -> Dict[int, List[str]]:
             continue
         listeners.setdefault(port, []).append(fields[3])
     return listeners
+
+
+def established_peers(runner: CommandRunner, local_port: int) -> List[str]:
+    """Return remote IPs of established TCP sessions accepted on local_port."""
+    result = runner.run(["ss", "-tnH"], check=False, timeout=10)
+    peers = []
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) < 5 or fields[0].upper() != "ESTAB":
+            continue
+        local_endpoint, peer_endpoint = fields[3], fields[4]
+        try:
+            if int(local_endpoint.rsplit(":", 1)[1].strip("]")) != local_port:
+                continue
+            peer_host = peer_endpoint.rsplit(":", 1)[0].strip("[]")
+            address = ipaddress.ip_address(peer_host)
+        except (ValueError, IndexError):
+            continue
+        if address.is_loopback:
+            continue
+        if str(address) not in peers:
+            peers.append(str(address))
+    return peers
+
+
+def discover_established_peers(runner: CommandRunner, local_port: int, *, attempts: int = 6, interval: int = 5) -> List[str]:
+    """Give the panel a short window to connect, then return stable peer IPs."""
+    previous = []
+    stable_rounds = 0
+    for attempt in range(attempts):
+        current = established_peers(runner, local_port)
+        if current and current == previous:
+            stable_rounds += 1
+        elif current:
+            stable_rounds = 1
+        else:
+            stable_rounds = 0
+        if stable_rounds >= 2:
+            return current
+        previous = current
+        if attempt + 1 < attempts:
+            time.sleep(interval)
+    return previous if stable_rounds >= 2 else []
 
 
 def is_service_active(runner: CommandRunner, service: str) -> bool:

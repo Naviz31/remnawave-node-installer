@@ -29,7 +29,7 @@ from .preflight import PreflightReport, run_preflight
 from .security import env_line, read_env_file, write_private
 from .ssh_guard import configure_fail2ban, detect_ssh_port
 from .state import InstallTransaction, StateStore
-from .system import CommandRunner, is_service_active, package_installed
+from .system import CommandRunner, discover_established_peers, is_service_active, package_installed
 from .ui import error_box, kv, step, title
 from .validators import parse_ips, valid_port
 from .website import SITE_ROOT, generate_site
@@ -188,6 +188,16 @@ def install(domain: str, secret: str, *, skip_dns: bool = False) -> int:
         tx.data["node_started"] = True
         tx.state.save(tx.data)
         step("Remnawave Node", "ok")
+
+        if not panel_ips:
+            step("Определение IP панели по входящему соединению", "running")
+            panel_ips = discover_established_peers(runner, node_port)
+            if panel_ips:
+                step(f"IP панели найден: {', '.join(panel_ips)}", "ok")
+            else:
+                step("IP панели не обнаружен; NODE_PORT будет закрыт до ручной настройки", "warn")
+            tx.data["panel_ips"] = panel_ips
+            tx.state.save(tx.data)
 
         maybe_fail("firewall")
         step("Firewall", "running")
