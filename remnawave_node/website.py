@@ -1,5 +1,6 @@
 import hashlib
 from pathlib import Path
+from typing import Callable, Optional
 
 
 SITE_ROOT = Path("/var/www/remnawave-node")
@@ -43,7 +44,7 @@ def _html(title: str, message: str, active: str, brand: str, variant: int) -> st
 <body><main class="layout-{variant}"><nav><a href="/" aria-label="{brand}">{brand}</a>{links}</nav><section class="hero"><span class="eyebrow">{brand}</span><h1>{title}</h1><p class="lead">{message}</p>{extra}</section><footer>Independent infrastructure services · {2026}</footer></main></body></html>'''
 
 
-def generate_site(root: Path = SITE_ROOT, identity: str = "default") -> None:
+def generate_site(root: Path = SITE_ROOT, identity: str = "default", on_created: Optional[Callable[[Path], None]] = None) -> None:
     brand = _brand(identity)
     variant = _layout_variant(identity)
     pages = {
@@ -53,7 +54,10 @@ def generate_site(root: Path = SITE_ROOT, identity: str = "default") -> None:
         "contact/index.html": ("Contact", "Operational notices are published here when required.", "contact"),
         "404.html": ("Page not found", "The requested page is not available.", "error"),
     }
+    root_existed = root.exists()
     root.mkdir(parents=True, exist_ok=True)
+    if not root_existed and on_created:
+        on_created(root)
     (root / "assets").mkdir(exist_ok=True)
     (root / "assets" / "site.css").write_text(_css(identity), encoding="utf-8")
     (root / "robots.txt").write_text("User-agent: *\nDisallow:\n", encoding="utf-8")

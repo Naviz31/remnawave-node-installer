@@ -2,7 +2,7 @@ import ipaddress
 import json
 import re
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from .constants import NODE_PORT
 from .system import CommandRunner
@@ -130,7 +130,7 @@ def iptables_ipv6_available(runner: CommandRunner) -> bool:
     return runner.exists("iptables") and runner.exists("ip6tables")
 
 
-def apply_plan(plan: FirewallPlan, runner: CommandRunner) -> List[str]:
+def apply_plan(plan: FirewallPlan, runner: CommandRunner, on_created: Optional[Callable[[str], None]] = None) -> List[str]:
     if plan.backend == "none":
         return []
     if plan.backend == "ufw":
@@ -145,10 +145,20 @@ def apply_plan(plan: FirewallPlan, runner: CommandRunner) -> List[str]:
             already_present = _ufw_rule_present(current, port, source)
             if not already_present:
                 runner.run(command, timeout=30)
-                created.append(f"ufw:{source}:{port}" if source else f"ufw:base:{port}")
+                identifier = f"ufw:{source}:{port}" if source else f"ufw:base:{port}"
+                created.append(identifier)
+                if on_created:
+                    on_created(identifier)
         return created
     for command in plan.commands:
         runner.run(command, timeout=30)
+        if on_created and plan.identifiers:
+            if plan.backend == "iptables":
+                tool = command[0]
+                identifier = next((value for value in plan.identifiers if value.startswith(f"{tool}:")), plan.identifiers[0])
+            else:
+                identifier = plan.identifiers[0]
+            on_created(identifier)
     return list(plan.identifiers)
 
 

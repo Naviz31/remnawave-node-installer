@@ -3,11 +3,11 @@ import shutil
 from pathlib import Path
 from typing import List
 
-from .certificates import install_renewal_hook, issue_certificate
+from .certificates import certificate_exists, install_renewal_hook, issue_certificate
 from .compose import compose, write_node_config
 from .constants import (
     APP_NAME,
-    FAIL2BAN_CONFIG,
+    COVER_SOCKET,
     INSTALLER_DIR,
     INSTALLER_LOG,
     LOGROTATE_CONFIG,
@@ -15,7 +15,6 @@ from .constants import (
     NODE_IMAGE,
     NODE_LOG_DIR,
     NODE_PORT,
-    RENEWAL_HOOK,
 )
 from .errors import InstallerError
 from .firewall import apply_plan, build_iptables_plan, build_nft_plan, build_ufw_plan, detect_backend, find_nft_input_chain, iptables_ipv6_available
@@ -97,8 +96,8 @@ def install_persistent_cli(tx: InstallTransaction) -> None:
     if not same_root:
         if existed:
             raise InstallerError(f"каталог {INSTALLER_DIR} уже существует; проверьте старую установку перед повтором", stage="snapshot")
-        shutil.copytree(source_root, INSTALLER_DIR, ignore=shutil.ignore_patterns(".git", "__pycache__", ".pytest_cache"))
         tx.record_path(INSTALLER_DIR)
+        shutil.copytree(source_root, INSTALLER_DIR, ignore=shutil.ignore_patterns(".git", "__pycache__", ".pytest_cache"))
     wrapper = Path("/usr/local/bin/remnawave-node")
     tx.mark_preexisting("wrapper", wrapper.exists())
     if wrapper.exists():
@@ -116,9 +115,9 @@ def write_logrotate(tx: InstallTransaction) -> None:
         tx.backup_file(LOGROTATE_CONFIG)
     LOGROTATE_CONFIG.parent.mkdir(parents=True, exist_ok=True)
     LOGROTATE_CONFIG.write_text("""/var/log/remnawave-node/*.log /var/log/remnanode/*.log {\n    daily\n    rotate 7\n    compress\n    missingok\n    notifempty\n    copytruncate\n}\n""", encoding="utf-8")
-    LOGROTATE_CONFIG.chmod(0o644)
     if not existed:
         tx.record_path(LOGROTATE_CONFIG)
+    LOGROTATE_CONFIG.chmod(0o644)
 
 
 def maybe_fail(stage: str) -> None:
@@ -147,14 +146,14 @@ def rollback(tx: InstallTransaction, runner: CommandRunner) -> None:
         if tx.data.get("created_firewall"):
             from .firewall import remove_managed_firewall
             remove_managed_firewall(tx.data["created_firewall"], runner, int(tx.data.get("node_port", NODE_PORT)))
-        if tx.data.get("certificate_created") and tx.data.get("domain"):
+        if tx.data.get("certificate_attempted") and not tx.data.get("certificate_preexisting") and tx.data.get("domain"):
             runner.run(["certbot", "delete", "--cert-name", tx.data["domain"], "--non-interactive"], check=False, timeout=120)
         tx.restore_backups()
         for path in sorted(tx.created_paths(), key=lambda value: len(str(value)), reverse=True):
-            if path.is_symlink() or path.is_file():
+            if path.is_symlink() or path.is_file() or (path.exists() and not path.is_dir()):
                 path.unlink(missing_ok=True)
             elif path.is_dir():
-                if path in (INSTALLER_DIR, SITE_ROOT, NODE_LOG_DIR):
+                if path in (INSTALLER_DIR, NODE_DIR, SITE_ROOT, NODE_LOG_DIR):
                     shutil.rmtree(path, ignore_errors=True)
                 else:
                     try:
@@ -217,7 +216,10 @@ def install(domain: str, secret: str, *, skip_dns: bool = False) -> int:
         NODE_LOG_DIR.mkdir(parents=True, exist_ok=True)
         if not log_dir_existed:
             tx.record_path(NODE_LOG_DIR)
+        node_dir_existed = NODE_DIR.exists()
         NODE_DIR.mkdir(parents=True, exist_ok=True)
+        if not node_dir_existed:
+            tx.record_path(NODE_DIR)
         tx.record_path(NODE_DIR / ".env")
         tx.record_path(NODE_DIR / "docker-compose.yml")
         tx.record_path(NODE_DIR / ".image")
@@ -245,8 +247,7 @@ def install(domain: str, secret: str, *, skip_dns: bool = False) -> int:
         else:
             plan = build_nft_plan(panel_ips, ssh_port, node_port)
             plan.warnings.append("активный firewall не найден; создана отдельная nftables-таблица")
-        for identifier in apply_plan(plan, runner):
-            tx.record_firewall(identifier)
+        apply_plan(plan, runner, on_created=tx.record_firewall)
         tx.data["firewall_backend"] = plan.backend
         tx.state.save(tx.data)
         for warning in plan.warnings:
@@ -255,30 +256,26 @@ def install(domain: str, secret: str, *, skip_dns: bool = False) -> int:
 
         maybe_fail("ssh")
         step("SSH protection", "running")
-        fail2ban_existed = FAIL2BAN_CONFIG.exists()
-        if configure_fail2ban(runner, tx.backup_file):
-            if not fail2ban_existed:
-                tx.record_path(FAIL2BAN_CONFIG)
-        else:
+        if not configure_fail2ban(runner, tx.backup_file, on_created=tx.record_path):
             step("Fail2ban не найден; существующая SSH-конфигурация не изменена", "warn")
         step("SSH protection", "ok")
 
         maybe_fail("nginx")
         step("Nginx и cover website", "running")
-        generate_site(SITE_ROOT, report.domain)
-        tx.record_path(SITE_ROOT)
-        write_nginx_config(report.domain, certificate=False, runner=runner, backup=tx.backup_file)
-        tx.record_path(Path("/etc/nginx/sites-available/remnawave-node.conf"))
-        tx.record_path(Path("/etc/nginx/sites-enabled/remnawave-node.conf"))
+        generate_site(SITE_ROOT, report.domain, on_created=tx.record_path)
+        tx.record_path(Path(COVER_SOCKET))
+        write_nginx_config(report.domain, certificate=False, runner=runner, backup=tx.backup_file, on_created=tx.record_path)
         step("Nginx и cover website", "ok")
 
         maybe_fail("tls")
         step("TLS certificate", "running")
+        tx.data["certificate_attempted"] = True
+        tx.data["certificate_preexisting"] = certificate_exists(report.domain)
+        tx.state.save(tx.data)
         cert_created = issue_certificate(report.domain, runner)
         tx.data["certificate_created"] = cert_created
         write_nginx_config(report.domain, certificate=True, runner=runner)
-        install_renewal_hook(report.domain, runner)
-        tx.record_path(RENEWAL_HOOK)
+        install_renewal_hook(report.domain, runner, on_created=tx.record_path)
         step("TLS certificate", "ok")
 
         maybe_fail("logs")
@@ -290,6 +287,8 @@ def install(domain: str, secret: str, *, skip_dns: bool = False) -> int:
         step("Health checks", "running")
         health = check_health(runner, node_port=node_port, domain=report.domain)
         tx.data["health_after_install"] = health
+        if health.get("xray") == "listening" and health.get("self_steal") == "ok":
+            tx.data["xray_was_active"] = True
         tx.state.save(tx.data)
         if health.get("container") != "running":
             raise InstallerError("контейнер remnanode не подтверждён как running", stage="health", hint="проверьте docker compose logs")

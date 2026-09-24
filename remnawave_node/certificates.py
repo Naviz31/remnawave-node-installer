@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Callable, Optional
 
 from .constants import CERTBOT_LIVE_DIR
 from .errors import InstallerError
@@ -22,9 +23,12 @@ def issue_certificate(domain: str, runner: CommandRunner) -> bool:
     return True
 
 
-def install_renewal_hook(domain: str, runner: CommandRunner) -> None:
+def install_renewal_hook(domain: str, runner: CommandRunner, on_created: Optional[Callable[[Path], None]] = None) -> None:
     hook = Path("/etc/letsencrypt/renewal-hooks/deploy/remnawave-node-reload")
+    existed = hook.exists()
     hook.parent.mkdir(parents=True, exist_ok=True)
     hook.write_text("#!/bin/sh\nsystemctl reload nginx\n", encoding="utf-8")
+    if not existed and on_created:
+        on_created(hook)
     hook.chmod(0o755)
     runner.run(["certbot", "renew", "--dry-run"], timeout=300)

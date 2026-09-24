@@ -1,3 +1,6 @@
+from pathlib import Path
+from typing import Callable, Optional
+
 from .constants import COVER_SOCKET, NGINX_AVAILABLE, NGINX_ENABLED
 from .system import CommandRunner
 
@@ -47,15 +50,21 @@ server {{
 '''
 
 
-def write_nginx_config(domain: str, *, certificate: bool, runner: CommandRunner, backup=None) -> None:
+def write_nginx_config(domain: str, *, certificate: bool, runner: CommandRunner, backup=None, on_created: Optional[Callable[[Path], None]] = None) -> None:
+    available_existed = NGINX_AVAILABLE.exists()
+    enabled_existed = NGINX_ENABLED.exists()
     if backup:
         backup(NGINX_AVAILABLE)
     NGINX_AVAILABLE.parent.mkdir(parents=True, exist_ok=True)
     NGINX_AVAILABLE.write_text(nginx_config(domain, certificate=certificate), encoding="utf-8")
+    if not available_existed and on_created:
+        on_created(NGINX_AVAILABLE)
     NGINX_AVAILABLE.chmod(0o644)
     if not NGINX_ENABLED.exists():
         NGINX_ENABLED.parent.mkdir(parents=True, exist_ok=True)
         NGINX_ENABLED.symlink_to(NGINX_AVAILABLE)
+        if not enabled_existed and on_created:
+            on_created(NGINX_ENABLED)
     runner.run(["nginx", "-t"], timeout=60)
     runner.run(["systemctl", "enable", "--now", "nginx"], timeout=60)
     runner.run(["systemctl", "reload", "nginx"], timeout=60)

@@ -36,6 +36,18 @@ class BackendRunner:
         return CommandResult(0, "")
 
 
+class FailingRunner(FakeRunner):
+    def __init__(self, fail_at):
+        super().__init__()
+        self.fail_at = fail_at
+
+    def run(self, args, **kwargs):
+        self.commands.append(args)
+        if len(self.commands) == self.fail_at:
+            raise RuntimeError("simulated firewall failure")
+        return CommandResult(0, "")
+
+
 class FirewallTests(unittest.TestCase):
     def test_ufw_restricts_node_to_panel(self):
         plan = build_ufw_plan(["203.0.113.10"], 22)
@@ -63,6 +75,13 @@ class FirewallTests(unittest.TestCase):
         commands = [" ".join(command) for command in plan.commands]
         self.assertFalse(any("ssh" in command or "22/tcp" in command for command in commands))
         self.assertNotIn("ufw:base:22", plan.identifiers)
+
+    def test_partial_apply_reports_created_chain_before_failure(self):
+        runner = FailingRunner(fail_at=4)
+        created = []
+        with self.assertRaises(RuntimeError):
+            apply_plan(build_iptables_plan(["203.0.113.10"], 22), runner, on_created=created.append)
+        self.assertIn("iptables:REMNAWAVE_NODE:2222", created)
 
     def test_ufw_source_rule_has_correct_rollback_identifier(self):
         runner = FakeRunner()

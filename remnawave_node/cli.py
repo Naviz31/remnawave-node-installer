@@ -141,6 +141,10 @@ def doctor() -> int:
     runner = _runner()
     title("Диагностика Remnawave Node")
     health = check_health(runner, NODE_DIR, int(state.get("node_port", NODE_PORT)), state.get("domain"))
+    if health.get("xray") == "listening" and health.get("self_steal") == "ok" and not state.get("xray_was_active"):
+        state["xray_was_active"] = True
+        StateStore().save(state)
+    xray_expected = bool(state.get("xray_was_active"))
     checks = {
         "state manifest": STATE_FILE.is_file(),
         "node .env mode 0600": NODE_DIR.joinpath(".env").exists() and oct(NODE_DIR.joinpath(".env").stat().st_mode & 0o777) == "0o600",
@@ -149,11 +153,12 @@ def doctor() -> int:
         "nginx config": health.get("nginx") == "valid",
         "cover unix socket": health.get("cover_backend") == "listening",
         "node port": health.get("node_port") == "listening",
-        "self-steal HTTPS": health.get("self_steal") in {"ok", "not-checked"},
+        "xray listener": health.get("xray") == "listening" if xray_expected else health.get("xray") in {"listening", "waiting-for-panel-config"},
+        "self-steal HTTPS": health.get("self_steal") == "ok" if xray_expected else health.get("self_steal") in {"ok", "not-checked"},
         "firewall record": bool(state.get("created_firewall")),
     }
     for label, passed in checks.items():
-        step(label, "ok" if passed else "error" if label == "self-steal HTTPS" else "warn")
+        step(label, "ok" if passed else "error" if label in {"self-steal HTTPS", "xray listener"} else "warn")
     return 0 if all(checks.values()) else 1
 
 
@@ -193,6 +198,8 @@ def repair() -> int:
     state["created_firewall"] = apply_plan(plan, runner)
     state["panel_ips"] = panel_ips
     health = check_health(runner, NODE_DIR, int(state.get("node_port", NODE_PORT)), state.get("domain"))
+    if health.get("xray") == "listening" and health.get("self_steal") == "ok":
+        state["xray_was_active"] = True
     StateStore().save({**state, "health_after_repair": health, "status": "installed"})
     return 0 if health.get("container") == "running" and health.get("nginx") == "valid" else 1
 
@@ -263,7 +270,10 @@ def update() -> int:
     new_id_result = runner.run(["docker", "image", "inspect", target_image, "--format", "{{.Id}}"], check=False, timeout=60)
     if rollback_tagged:
         runner.run(["docker", "rmi", backup_tag], check=False, timeout=60)
-    StateStore().save({**state, "image": target_image, "image_id": new_id_result.stdout.strip(), "last_update": time.time()})
+    next_state = {**state, "image": target_image, "image_id": new_id_result.stdout.strip(), "last_update": time.time()}
+    if health.get("xray") == "listening" and health.get("self_steal") == "ok":
+        next_state["xray_was_active"] = True
+    StateStore().save(next_state)
     step("Обновление", "ok")
     return 0
 
@@ -287,10 +297,10 @@ def uninstall(confirmed: bool) -> int:
             shutil.copy2(backup, source)
     for value in sorted(state.get("created_paths", []), key=len, reverse=True):
         path = Path(value)
-        if path.is_symlink() or path.is_file():
+        if path.is_symlink() or path.is_file() or (path.exists() and not path.is_dir()):
             path.unlink(missing_ok=True)
         elif path.is_dir():
-            shutil.rmtree(path, ignore_errors=True) if path in (SITE_ROOT, INSTALLER_DIR, NODE_LOG_DIR) else path.rmdir()
+            shutil.rmtree(path, ignore_errors=True) if path in (SITE_ROOT, INSTALLER_DIR, NODE_DIR, NODE_LOG_DIR) else path.rmdir()
     restore_service_states(runner, state.get("services_before", {}))
     if state.get("certificate_created") and state.get("domain"):
         runner.run(["certbot", "delete", "--cert-name", state["domain"], "--non-interactive"], check=False, timeout=120)
