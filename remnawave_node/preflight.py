@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
-from .constants import COVER_SOCKET, FAIL2BAN_CONFIG, LOGROTATE_CONFIG, NGINX_AVAILABLE, NGINX_ENABLED, NODE_DIR, NODE_PORT, RENEWAL_HOOK, SUPPORTED_OS
+from .constants import COVER_SOCKET, FAIL2BAN_CONFIG, LOGROTATE_CONFIG, NGINX_AVAILABLE, NGINX_ENABLED, NODE_DIR, NODE_PORT, RENEWAL_HOOK, SUPPORTED_DISTROS
 from .errors import PreflightError
 from .system import CommandRunner, memory_bytes, port_listeners, public_ip, read_os_release
 from .validators import domain_points_to, normalize_domain
@@ -31,8 +31,8 @@ def run_preflight(domain: str, *, runner: CommandRunner, skip_dns: bool = False,
     os_data = read_os_release()
     report.os_name = os_data.get("ID", "unknown")
     report.os_version = os_data.get("VERSION_ID", "unknown")
-    if report.os_name not in SUPPORTED_OS or report.os_version not in SUPPORTED_OS[report.os_name]:
-        raise PreflightError(f"ОС {report.os_name} {report.os_version} не поддерживается; нужны Ubuntu 22.04/24.04 или Debian 12/13", stage="preflight")
+    if report.os_name not in SUPPORTED_DISTROS:
+        raise PreflightError(f"дистрибутив {report.os_name} не поддерживается; нужны Ubuntu или Debian", stage="preflight")
     if not Path("/run/systemd/system").exists() and not runner.exists("systemctl"):
         raise PreflightError("systemd не найден", stage="preflight")
     if platform.machine().lower() not in {"x86_64", "amd64", "aarch64", "arm64"}:

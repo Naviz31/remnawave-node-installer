@@ -24,10 +24,7 @@ CERTBOT_LIVE_DIR = Path("/etc/letsencrypt/live")
 DEFAULT_PANEL_IP_ENV = Path("/etc/remnawave-node/config.env")
 RENEWAL_HOOK = Path("/etc/letsencrypt/renewal-hooks/deploy/remnawave-node-reload")
 
-SUPPORTED_OS = {
-    "ubuntu": {"22.04", "24.04"},
-    "debian": {"12", "13"},
-}
+SUPPORTED_DISTROS = {"ubuntu", "debian"}
 
 MANAGED_PATHS = [
     NODE_DIR,
