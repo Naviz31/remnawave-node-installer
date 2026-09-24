@@ -1,0 +1,2 @@
+# Runtime intentionally uses only the Python standard library.
+# The test suite also uses unittest from the standard library.
