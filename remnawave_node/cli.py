@@ -33,13 +33,23 @@ def _root_check() -> None:
 
 
 def _read_interactive(prompt: str, *, secret: bool = False) -> str:
+    # The bootstrap deliberately connects stdin to /dev/tty before starting
+    # Python. Re-opening the device as a seekable ``r+`` stream is not
+    # portable: Python 3.14 can reject character devices with
+    # ``io.UnsupportedOperation: File or stream is not seekable``.
+    if sys.stdin.isatty():
+        if secret:
+            return getpass.getpass(prompt)
+        return input(prompt).strip()
+
     tty_path = Path("/dev/tty")
     if tty_path.exists():
-        with tty_path.open("r+") as tty:
-            if secret:
-                return getpass.getpass(prompt, stream=tty)
-            tty.write(prompt)
-            tty.flush()
+        if secret:
+            # getpass opens /dev/tty itself without requiring a seekable
+            # read/write TextIOWrapper.
+            return getpass.getpass(prompt)
+        with tty_path.open("r", encoding="utf-8", errors="replace") as tty:
+            print(prompt, end="", file=sys.stderr, flush=True)
             return tty.readline().strip()
     return getpass.getpass(prompt) if secret else input(prompt).strip()
 

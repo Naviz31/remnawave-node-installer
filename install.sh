@@ -17,6 +17,11 @@ if [[ "$(id -u)" -ne 0 ]]; then
   die "Запустите установщик от root: sudo bash install.sh"
 fi
 
+# A previous rollback/uninstall may have removed the directory from which the
+# caller started. Continue from a stable directory so Python and error
+# handlers do not inherit a deleted cwd.
+cd /
+
 SCRIPT_DIR=""
 if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
   candidate="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P || true)"
