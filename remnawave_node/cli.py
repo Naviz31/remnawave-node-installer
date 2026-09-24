@@ -26,6 +26,9 @@ from .validators import normalize_domain
 from .website import SITE_ROOT, generate_site
 
 
+INPUT_EXIT_HINT = "(Ctrl+C — выход)"
+
+
 def _root_check() -> None:
     if hasattr(os, "geteuid") and os.geteuid() != 0:
         raise InstallerError("команда должна выполняться от root")
@@ -47,6 +50,32 @@ def _read_interactive(prompt: str, *, secret: bool = False) -> str:
             print(prompt, end="", file=sys.stderr, flush=True)
             return tty.readline().strip()
     return input(prompt).strip()
+
+
+def _read_domain() -> str:
+    while True:
+        raw = _read_interactive(f"Домен ноды {INPUT_EXIT_HINT}: ")
+        try:
+            return normalize_domain(raw)
+        except ValueError as exc:
+            print(f"Ошибка: {exc}. Повторите ввод {INPUT_EXIT_HINT}.", file=sys.stderr)
+
+
+def _read_required(prompt: str) -> str:
+    while True:
+        value = _read_interactive(f"{prompt} {INPUT_EXIT_HINT}: ")
+        if value:
+            return value
+        print(f"Значение не может быть пустым. Повторите ввод {INPUT_EXIT_HINT}.", file=sys.stderr)
+
+
+def _read_secret_pair(first_prompt: str, second_prompt: str):
+    while True:
+        first = _read_required(first_prompt)
+        second = _read_required(second_prompt)
+        if first == second:
+            return first
+        print(f"Ключи не совпадают. Повторите ввод {INPUT_EXIT_HINT}.", file=sys.stderr)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -83,7 +112,10 @@ def _existing_install_menu(skip_dns: bool) -> int:
     print("\nУстановка уже найдена.")
     print(f"Домен: {state.get('domain', 'не задан')}")
     print("1. Status\n2. Repair\n3. Reconfigure domain\n4. Reconfigure SECRET_KEY\n5. Uninstall\n6. Exit")
-    choice = input("Выберите действие [1-6]: ").strip()
+    choice = _read_interactive(f"Выберите действие [1-6] {INPUT_EXIT_HINT}: ")
+    while choice not in {"1", "2", "3", "4", "5", "6"}:
+        print(f"Неверный выбор. Повторите ввод {INPUT_EXIT_HINT}.", file=sys.stderr)
+        choice = _read_interactive(f"Выберите действие [1-6] {INPUT_EXIT_HINT}: ")
     if choice == "1":
         return show_status()
     if choice == "2":
@@ -328,10 +360,7 @@ def repair() -> int:
 def set_secret() -> int:
     _root_check()
     state = _load_state()
-    first = _read_interactive("Новый ключ ноды из панели Remnawave: ", secret=True)
-    second = _read_interactive("Повторите ключ: ", secret=True)
-    if not first or first != second:
-        raise InstallerError("ключи не совпадают или пусты")
+    first = _read_secret_pair("Новый ключ ноды из панели Remnawave", "Повторите ключ")
     env_path = NODE_DIR / ".env"
     old = env_path.read_text(encoding="utf-8")
     old_mode = env_path.stat().st_mode & 0o777
@@ -349,7 +378,7 @@ def set_secret() -> int:
         write_private(env_path, old, mode=old_mode)
         compose(runner, NODE_DIR, "up", "-d", check=False)
         raise
-    print("Ключ заменён; значение не выводится.")
+    print("Ключ заменён.")
     return 0
 
 
@@ -401,9 +430,8 @@ def uninstall(confirmed: bool) -> int:
     state = _load_state()
     if not confirmed:
         print("Будут удалены только ресурсы из install-state.json; чужие файлы и правила firewall сохранятся.")
-        if input("Введите UNINSTALL для продолжения: ").strip() != "UNINSTALL":
-            print("Отменено.")
-            return 0
+        while _read_interactive(f"Введите UNINSTALL для продолжения {INPUT_EXIT_HINT}: ") != "UNINSTALL":
+            print(f"Неверное подтверждение. Повторите ввод {INPUT_EXIT_HINT}.", file=sys.stderr)
     runner = _runner()
     if (NODE_DIR / "docker-compose.yml").exists():
         compose(runner, NODE_DIR, "down", check=False)
@@ -448,11 +476,8 @@ def main(argv=None) -> int:
                 existing_result = _existing_install_menu(getattr(args, "skip_dns_check", False))
                 if existing_result >= 0:
                     return existing_result
-            domain = _read_interactive("Домен ноды: ")
-            normalize_domain(domain)
-            secret = _read_interactive("Ключ ноды из панели Remnawave: ", secret=True)
-            if not secret:
-                raise InstallerError("ключ не может быть пустым")
+            domain = _read_domain()
+            secret = _read_required("Ключ ноды из панели Remnawave")
             return install(domain, secret, skip_dns=getattr(args, "skip_dns_check", False))
         if command == "status":
             return show_status()
