@@ -39,19 +39,44 @@ def _read_interactive(prompt: str, *, secret: bool = False) -> str:
     # ``io.UnsupportedOperation: File or stream is not seekable``.
     if sys.stdin.isatty():
         if secret:
-            return getpass.getpass(prompt)
+            return _read_secret_line(sys.stdin, prompt)
         return input(prompt).strip()
 
     tty_path = Path("/dev/tty")
     if tty_path.exists():
         if secret:
-            # getpass opens /dev/tty itself without requiring a seekable
-            # read/write TextIOWrapper.
-            return getpass.getpass(prompt)
+            with tty_path.open("r", encoding="utf-8", errors="replace") as tty:
+                return _read_secret_line(tty, prompt)
         with tty_path.open("r", encoding="utf-8", errors="replace") as tty:
             print(prompt, end="", file=sys.stderr, flush=True)
             return tty.readline().strip()
     return getpass.getpass(prompt) if secret else input(prompt).strip()
+
+
+def _read_secret_line(stream, prompt: str) -> str:
+    """Read a hidden line while keeping the terminal's normal paste handling."""
+    try:
+        import termios
+    except ImportError:
+        return getpass.getpass(prompt)
+
+    try:
+        fd = stream.fileno()
+        original = termios.tcgetattr(fd)
+    except (AttributeError, OSError, termios.error):
+        # Non-terminal streams and platforms without termios still need the
+        # portable getpass fallback.
+        return getpass.getpass(prompt)
+
+    hidden = list(original)
+    hidden[3] &= ~termios.ECHO
+    termios.tcsetattr(fd, termios.TCSANOW, hidden)
+    try:
+        print(prompt, end="", file=sys.stderr, flush=True)
+        return stream.readline().rstrip("\r\n")
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, original)
+        print(file=sys.stderr, flush=True)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -333,8 +358,8 @@ def repair() -> int:
 def set_secret() -> int:
     _root_check()
     state = _load_state()
-    first = getpass.getpass("Новый ключ ноды из панели Remnawave: ")
-    second = getpass.getpass("Повторите ключ: ")
+    first = _read_interactive("Новый ключ ноды из панели Remnawave: ", secret=True)
+    second = _read_interactive("Повторите ключ: ", secret=True)
     if not first or first != second:
         raise InstallerError("ключи не совпадают или пусты")
     env_path = NODE_DIR / ".env"
