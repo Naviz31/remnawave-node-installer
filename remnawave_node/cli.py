@@ -63,13 +63,16 @@ def _parser() -> argparse.ArgumentParser:
 
 def _load_state() -> Dict:
     state = StateStore().load()
-    if not state or state.get("status") not in {"installed", "in_progress", "rolled_back"}:
+    if not state or state.get("status") not in {"installed", "in_progress", "repairing", "repair_failed", "rolled_back"}:
         raise InstallerError("установка Remnawave Node не найдена")
     return state
 
 
 def _existing_install_menu(skip_dns: bool) -> int:
     state = StateStore().load()
+    if state.get("status") in {"repairing", "repair_failed"}:
+        print("Найден незавершённый repair. Запустите `sudo remnawave-node repair` для восстановления или `sudo remnawave-node uninstall` для удаления.")
+        return 0
     if state.get("status") != "installed":
         return -1
     print("\nУстановка уже найдена.")
@@ -124,6 +127,7 @@ def show_status() -> int:
     runner = _runner()
     health = check_health(runner, NODE_DIR, int(state.get("node_port", NODE_PORT)), state.get("domain"))
     title(APP_NAME)
+    kv("Состояние", state.get("status", "unknown"), "ok" if state.get("status") == "installed" else "warn")
     kv("Домен", state.get("domain", "не задан"))
     kv("ОС", f"{read_os_release().get('PRETTY_NAME', 'unknown')}")
     kv("Образ", state.get("image", NODE_IMAGE))
@@ -140,6 +144,8 @@ def doctor() -> int:
     state = _load_state()
     runner = _runner()
     title("Диагностика Remnawave Node")
+    if state.get("status") in {"repairing", "repair_failed"}:
+        step("Обнаружен незавершённый repair; запустите команду repair для восстановления", "warn")
     health = check_health(runner, NODE_DIR, int(state.get("node_port", NODE_PORT)), state.get("domain"))
     if health.get("xray") == "listening" and health.get("self_steal") == "ok" and not state.get("xray_was_active"):
         state["xray_was_active"] = True
@@ -147,6 +153,7 @@ def doctor() -> int:
     xray_expected = bool(state.get("xray_was_active"))
     checks = {
         "state manifest": STATE_FILE.is_file(),
+        "state status": state.get("status") == "installed",
         "node .env mode 0600": NODE_DIR.joinpath(".env").exists() and oct(NODE_DIR.joinpath(".env").stat().st_mode & 0o777) == "0o600",
         "compose file": NODE_DIR.joinpath("docker-compose.yml").is_file(),
         "container": health.get("container") == "running",
@@ -155,7 +162,12 @@ def doctor() -> int:
         "node port": health.get("node_port") == "listening",
         "xray listener": health.get("xray") == "listening" if xray_expected else health.get("xray") in {"listening", "waiting-for-panel-config"},
         "self-steal HTTPS": health.get("self_steal") == "ok" if xray_expected else health.get("self_steal") in {"ok", "not-checked"},
-        "firewall rules": firewall_is_applied(state.get("created_firewall", []), runner, int(state.get("node_port", NODE_PORT))),
+        "firewall rules": firewall_is_applied(
+            state.get("created_firewall", []),
+            runner,
+            int(state.get("node_port", NODE_PORT)),
+            state.get("panel_ips", []),
+        ),
     }
     for label, passed in checks.items():
         step(label, "ok" if passed else "error" if label in {"self-steal HTTPS", "xray listener"} else "warn")
@@ -197,23 +209,55 @@ def _remember_firewall_item(items, item):
         items.append(item)
 
 
+def _recover_interrupted_repair(state, runner, node_port):
+    snapshot = state.get("repair_previous_firewall")
+    if not snapshot:
+        state["status"] = "installed"
+        StateStore().save(state)
+        return
+    old_identifiers = list(snapshot.get("created_firewall", []))
+    old_backend = snapshot.get("firewall_backend") or state.get("firewall_backend") or detect_backend(runner)
+    old_panel_ips = snapshot.get("panel_ips", state.get("panel_ips", []))
+    ssh_port = detect_ssh_port(runner)
+    old_plan = _build_firewall_plan(runner, old_backend, old_panel_ips, ssh_port, node_port, old_identifiers) if old_identifiers else None
+    try:
+        remove_managed_firewall(state.get("created_firewall", []), runner, node_port)
+        if old_plan is not None:
+            apply_plan(old_plan, runner)
+        state["created_firewall"] = old_identifiers
+        state["firewall_backend"] = old_backend
+        state["panel_ips"] = old_panel_ips
+        state.pop("repair_previous_firewall", None)
+        state["status"] = "installed"
+        StateStore().save(state)
+    except Exception as exc:
+        state["status"] = "repair_failed"
+        try:
+            StateStore().save(state)
+        except Exception:
+            pass
+        raise InstallerError(f"предыдущий repair прерван; старый firewall не удалось восстановить: {exc}", stage="recovery") from exc
+
+
 def repair() -> int:
     _root_check()
     state = _load_state()
+    runner = _runner()
+    node_port = int(state.get("node_port", NODE_PORT))
+    if state.get("status") in {"repairing", "repair_failed"}:
+        _recover_interrupted_repair(state, runner, node_port)
     domain = normalize_domain(state["domain"])
     values = read_node_config(NODE_DIR)
     secret = values.get("SECRET_KEY", "")
     if not secret:
         raise InstallerError("SECRET_KEY не найден в закрытом .env; используйте set-secret")
-    runner = _runner()
-    write_node_config(NODE_DIR, node_port=int(state.get("node_port", NODE_PORT)), secret=secret, image=state.get("image", NODE_IMAGE), runner=runner)
+    write_node_config(NODE_DIR, node_port=node_port, secret=secret, image=state.get("image", NODE_IMAGE), runner=runner)
     compose(runner, NODE_DIR, "up", "-d")
     generate_site(SITE_ROOT, domain)
     write_nginx_config(domain, certificate=True, runner=runner)
     panel_ips = panel_ips_from_environment() or state.get("panel_ips", [])
     if not panel_ips:
         raise InstallerError("PANEL_IPS обязателен для repair: задайте IP панели в /etc/remnawave-node/config.env")
-    node_port = int(state.get("node_port", NODE_PORT))
     backend = detect_backend(runner)
     ssh_port = detect_ssh_port(runner)
     old_identifiers = list(state.get("created_firewall", []))
@@ -229,7 +273,6 @@ def repair() -> int:
     }
     state["created_firewall"] = []
     StateStore().save(state)
-    remove_managed_firewall(old_identifiers, runner, node_port)
     new_created = []
 
     def record_new_firewall(item):
@@ -239,35 +282,42 @@ def repair() -> int:
         StateStore().save(state)
 
     try:
+        remove_managed_firewall(old_identifiers, runner, node_port)
         apply_plan(plan, runner, on_created=record_new_firewall)
-    except Exception as exc:
-        if new_created:
-            remove_managed_firewall(new_created, runner, node_port)
-        if old_plan is not None:
-            restored = []
-            try:
-                apply_plan(old_plan, runner, on_created=lambda item: _remember_firewall_item(restored, item))
-            except Exception as restore_exc:
-                state["status"] = "repair_failed"
-                StateStore().save(state)
-                raise InstallerError(f"repair firewall не применён, и прежний firewall не удалось восстановить: {restore_exc}", stage="firewall") from exc
-        state["created_firewall"] = old_identifiers
-        state["firewall_backend"] = old_backend
-        state["panel_ips"] = old_panel_ips
+        state["created_firewall"] = new_created
+        state["firewall_backend"] = plan.backend
+        state["panel_ips"] = panel_ips
+        StateStore().save(state)
+        health = check_health(runner, NODE_DIR, node_port, state.get("domain"))
+        if health.get("xray") == "listening" and health.get("self_steal") == "ok":
+            state["xray_was_active"] = True
+        require_install_health(health, xray_was_active=bool(state.get("xray_was_active")))
         state.pop("repair_previous_firewall", None)
+        state["health_after_repair"] = health
         state["status"] = "installed"
         StateStore().save(state)
-        raise InstallerError(f"repair firewall не применён; прежний firewall восстановлен: {exc}", stage="firewall") from exc
-    state["created_firewall"] = new_created
-    state["firewall_backend"] = plan.backend
-    state["panel_ips"] = panel_ips
-    state.pop("repair_previous_firewall", None)
-    health = check_health(runner, NODE_DIR, int(state.get("node_port", NODE_PORT)), state.get("domain"))
-    if health.get("xray") == "listening" and health.get("self_steal") == "ok":
-        state["xray_was_active"] = True
-    require_install_health(health, xray_was_active=bool(state.get("xray_was_active")))
-    StateStore().save({**state, "health_after_repair": health, "status": "installed"})
-    return 0
+        return 0
+    except Exception as exc:
+        try:
+            remove_managed_firewall(new_created, runner, node_port)
+            remove_managed_firewall(old_identifiers, runner, node_port)
+            restored = []
+            if old_plan is not None:
+                apply_plan(old_plan, runner, on_created=lambda item: _remember_firewall_item(restored, item))
+            state["created_firewall"] = restored or old_identifiers
+            state["firewall_backend"] = old_backend
+            state["panel_ips"] = old_panel_ips
+            state.pop("repair_previous_firewall", None)
+            state["status"] = "installed"
+            StateStore().save(state)
+        except Exception as restore_exc:
+            state["status"] = "repair_failed"
+            try:
+                StateStore().save(state)
+            except Exception:
+                pass
+            raise InstallerError(f"repair не завершён, и прежний firewall не удалось восстановить: {restore_exc}", stage="recovery") from exc
+        raise InstallerError(f"repair отменён; прежний firewall и state восстановлены: {exc}", stage=getattr(exc, "stage", "repair")) from exc
 
 
 def set_secret() -> int:

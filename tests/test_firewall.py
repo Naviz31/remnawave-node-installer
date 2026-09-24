@@ -29,6 +29,16 @@ class AppliedUfwRunner(FakeRunner):
         return CommandResult(0, "")
 
 
+class AppliedIptablesRunner(FakeRunner):
+    def run(self, args, **kwargs):
+        self.commands.append(args)
+        if args == ["iptables", "-S", "REMNAWAVE_NODE"]:
+            return CommandResult(0, "-A REMNAWAVE_NODE -p tcp -s 203.0.113.10 --dport 2222 -j ACCEPT\n-A REMNAWAVE_NODE -p tcp --dport 2222 -j DROP\n")
+        if args == ["iptables", "-S", "INPUT"]:
+            return CommandResult(0, "-A INPUT -p tcp --dport 2222 -j REMNAWAVE_NODE\n")
+        return CommandResult(1, "")
+
+
 class BackendRunner:
     def __init__(self, nft_json="{}"):
         self.nft_json = nft_json
@@ -105,6 +115,11 @@ class FirewallTests(unittest.TestCase):
         runner = AppliedUfwRunner()
         identifiers = ["ufw:base:80", "ufw:base:443", "ufw:203.0.113.10:2222"]
         self.assertTrue(firewall_is_applied(identifiers, runner))
+
+    def test_doctor_verifies_iptables_sources_and_drop(self):
+        runner = AppliedIptablesRunner()
+        identifiers = ["iptables:REMNAWAVE_NODE:2222"]
+        self.assertTrue(firewall_is_applied(identifiers, runner, panel_ips=["203.0.113.10"]))
 
     def test_ufw_matching_does_not_treat_8080_as_port_80(self):
         runner = UfwStatusRunner()

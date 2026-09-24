@@ -178,7 +178,7 @@ def _ufw_rule_present(current: str, port: str, source: str) -> bool:
     return False
 
 
-def firewall_is_applied(identifiers: List[str], runner: CommandRunner, node_port: int = NODE_PORT) -> bool:
+def firewall_is_applied(identifiers: List[str], runner: CommandRunner, node_port: int = NODE_PORT, panel_ips: Optional[List[str]] = None) -> bool:
     """Verify managed firewall resources still exist without changing firewall state."""
     if not identifiers:
         return False
@@ -204,13 +204,34 @@ def firewall_is_applied(identifiers: List[str], runner: CommandRunner, node_port
                 tool, chain, port = parts
             chain_rules = iptables_cache.setdefault((tool, chain), runner.run([tool, "-S", chain], check=False, timeout=15))
             input_rules = iptables_cache.setdefault((tool, "INPUT"), runner.run([tool, "-S", "INPUT"], check=False, timeout=15))
+            chain_lines = [line.split() for line in chain_rules.stdout.splitlines()]
             jump_present = any(
                 (fields[:2] == ["-A", "INPUT"] and "-p" in fields and fields[fields.index("-p") + 1] == "tcp"
                  and "--dport" in fields and fields[fields.index("--dport") + 1] == port
                  and "-j" in fields and fields[fields.index("-j") + 1] == chain)
                 for fields in (line.split() for line in input_rules.stdout.splitlines())
             )
-            if chain_rules.returncode != 0 or not jump_present:
+            drop_present = any(
+                fields[:2] == ["-A", chain] and "--dport" in fields and fields[fields.index("--dport") + 1] == port
+                and "-j" in fields and fields[fields.index("-j") + 1] == "DROP"
+                for fields in chain_lines
+            )
+            if panel_ips:
+                expected_tool = tool
+                expected_chain = chain
+                expected_ips = [ip for ip in panel_ips if (":" in ip) == (expected_tool == "ip6tables")]
+                allowed = all(
+                    any(
+                        fields[:2] == ["-A", expected_chain] and "-s" in fields and fields[fields.index("-s") + 1] == ip
+                        and "--dport" in fields and fields[fields.index("--dport") + 1] == port
+                        and "-j" in fields and fields[fields.index("-j") + 1] == "ACCEPT"
+                        for fields in chain_lines
+                    )
+                    for ip in expected_ips
+                )
+            else:
+                allowed = True
+            if chain_rules.returncode != 0 or not jump_present or not drop_present or not allowed:
                 return False
         elif identifier.startswith("nft:"):
             if identifier == "nft:remnawave_node":
