@@ -7,10 +7,18 @@ SITE_ROOT = Path("/var/www/remnawave-node")
 
 CSS = """*{box-sizing:border-box}html{background:#0c1117;color:#e7edf4;font:16px/1.6 Inter,ui-sans-serif,system-ui,sans-serif}body{margin:0;min-height:100vh}main{max-width:920px;margin:0 auto;padding:72px 24px}nav{display:flex;gap:22px;margin-bottom:86px}nav a{color:#aab8c7;text-decoration:none}nav a:hover{color:#fff}.eyebrow{color:#77d2b5;letter-spacing:.16em;text-transform:uppercase;font-size:.76rem}.hero{max-width:650px}.hero h1{font-size:clamp(2.5rem,7vw,5.6rem);line-height:.98;letter-spacing:-.065em;margin:18px 0}.lead{color:#aab8c7;font-size:1.25rem;max-width:580px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:64px}.card{border:1px solid #26323f;border-radius:16px;padding:20px;background:#111923}.card strong{display:block;font-size:1.2rem}.ok{color:#77d2b5}.muted{color:#718092}footer{margin-top:100px;color:#718092;font-size:.9rem}@media(max-width:680px){main{padding-top:34px}nav{margin-bottom:58px}.grid{grid-template-columns:1fr}}"""
 
+PALETTE = ("#77d2b5", "#8bd3ff", "#f4c37d", "#c5a7ff", "#f19bb5")
+
 
 def _brand(identity: str = "default") -> str:
     token = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:6].upper()
     return f"Northline {token}"
+
+
+def _css(identity: str) -> str:
+    digest = hashlib.sha256(identity.encode("utf-8")).digest()
+    accent = PALETTE[digest[0] % len(PALETTE)]
+    return CSS.replace("#77d2b5", accent)
 
 
 def _html(title: str, message: str, active: str, brand: str) -> str:
@@ -32,7 +40,7 @@ def generate_site(root: Path = SITE_ROOT, identity: str = "default") -> None:
     }
     root.mkdir(parents=True, exist_ok=True)
     (root / "assets").mkdir(exist_ok=True)
-    (root / "assets" / "site.css").write_text(CSS, encoding="utf-8")
+    (root / "assets" / "site.css").write_text(_css(identity), encoding="utf-8")
     (root / "robots.txt").write_text("User-agent: *\nDisallow:\n", encoding="utf-8")
     for relative, values in pages.items():
         target = root / relative

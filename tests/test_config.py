@@ -30,6 +30,10 @@ class ConfigTests(unittest.TestCase):
             first_text = (Path(first) / "index.html").read_text(encoding="utf-8")
             second_text = (Path(second) / "index.html").read_text(encoding="utf-8")
             self.assertNotEqual(first_text, second_text)
+            self.assertNotEqual(
+                (Path(first) / "assets" / "site.css").read_text(encoding="utf-8"),
+                (Path(second) / "assets" / "site.css").read_text(encoding="utf-8"),
+            )
 
 
 if __name__ == "__main__":

@@ -148,7 +148,7 @@ def doctor() -> int:
         "firewall record": bool(state.get("created_firewall")),
     }
     for label, passed in checks.items():
-        step(label, "ok" if passed else "warn")
+        step(label, "ok" if passed else "error" if label == "self-steal HTTPS" else "warn")
     return 0 if all(checks.values()) else 1
 
 
@@ -239,8 +239,10 @@ def update() -> int:
         compose(runner, NODE_DIR, "pull")
         compose(runner, NODE_DIR, "up", "-d")
         health = check_health(runner, NODE_DIR, int(state.get("node_port", NODE_PORT)), state.get("domain"))
-        if health.get("container") != "running" or health.get("self_steal") == "failed":
-            raise InstallerError("новый контейнер не подтвердил running и Self-Steal health check")
+        if health.get("container") != "running":
+            raise InstallerError("новый контейнер не подтвердил состояние running")
+        if health.get("self_steal") == "failed":
+            raise InstallerError("новый контейнер запущен, но внешний Self-Steal HTTPS health check не прошёл")
     except Exception:
         step("Обновление не прошло; возвращаю предыдущий образ", "warn")
         compose(runner, NODE_DIR, "down", check=False)
