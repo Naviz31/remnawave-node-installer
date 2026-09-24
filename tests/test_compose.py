@@ -7,6 +7,7 @@ class ComposeTests(unittest.TestCase):
     def test_compose_uses_host_network_and_fixed_image(self):
         text = compose_text("remnawave/node:3.4.1")
         self.assertIn("network_mode: host", text)
+        self.assertIn("/dev/shm:/dev/shm:rw", text)
         self.assertIn("remnawave/node:3.4.1", text)
         self.assertNotIn(":latest", text)
 

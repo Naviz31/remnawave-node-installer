@@ -8,8 +8,8 @@ class ConfigTests(unittest.TestCase):
     def test_nginx_never_listens_on_external_443(self):
         text = nginx_config("node.example.com", certificate=True)
         self.assertNotIn("listen 443", text)
-        self.assertIn("listen 127.0.0.1:9443 ssl", text)
-        self.assertIn("listen 127.0.0.1:9443 ssl;", text)
+        self.assertIn("listen unix:/dev/shm/nginx.sock ssl;", text)
+        self.assertNotIn("9443", text)
         self.assertIn("ssl_certificate /etc/letsencrypt/live/node.example.com/fullchain.pem", text)
 
     def test_cover_text_is_neutral(self):

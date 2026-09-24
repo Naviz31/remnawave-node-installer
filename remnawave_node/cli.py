@@ -3,30 +3,43 @@ import getpass
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Dict
 
 from . import __version__
 from .compose import compose, read_node_config, write_node_config
-from .constants import APP_NAME, COVER_PORT, FAIL2BAN_CONFIG, INSTALLER_DIR, INSTALLER_LOG, NODE_DIR, NODE_IMAGE, NODE_PORT, STATE_FILE
+from .constants import APP_NAME, INSTALLER_DIR, INSTALLER_LOG, NODE_DIR, NODE_IMAGE, NODE_LOG_DIR, NODE_PORT, STATE_FILE
 from .errors import InstallerError
-from .firewall import apply_plan, build_iptables_plan, build_nft_plan, build_ufw_plan, detect_backend, remove_managed_firewall
+from .firewall import apply_plan, build_iptables_plan, build_nft_plan, build_ufw_plan, detect_backend, find_nft_input_chain, remove_managed_firewall
 from .health import check_health
 from .install import install, panel_ips_from_environment
 from .logging_utils import configure_logger
 from .nginx import write_nginx_config
-from .security import read_env_file, write_private
+from .security import env_line, read_env_file, write_private
 from .state import StateStore
-from .system import CommandRunner, port_listeners, read_os_release
+from .system import CommandRunner, read_os_release
 from .ssh_guard import detect_ssh_port
 from .ui import error_box, kv, step, title
 from .validators import normalize_domain
-from .website import SITE_ROOT
+from .website import SITE_ROOT, generate_site
 
 
 def _root_check() -> None:
     if hasattr(os, "geteuid") and os.geteuid() != 0:
         raise InstallerError("команда должна выполняться от root")
+
+
+def _read_interactive(prompt: str, *, secret: bool = False) -> str:
+    tty_path = Path("/dev/tty")
+    if tty_path.exists():
+        with tty_path.open("r+") as tty:
+            if secret:
+                return getpass.getpass(prompt, stream=tty)
+            tty.write(prompt)
+            tty.flush()
+            return tty.readline().strip()
+    return getpass.getpass(prompt) if secret else input(prompt).strip()
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -106,16 +119,12 @@ def doctor() -> int:
         "compose file": NODE_DIR.joinpath("docker-compose.yml").is_file(),
         "container": health.get("container") == "running",
         "nginx config": health.get("nginx") == "valid",
-        "cover localhost": health.get("cover_backend") == "listening",
+        "cover unix socket": health.get("cover_backend") == "listening",
         "node port": health.get("node_port") == "listening",
         "firewall record": bool(state.get("created_firewall")),
     }
     for label, passed in checks.items():
         step(label, "ok" if passed else "warn")
-    listeners = port_listeners(runner)
-    if COVER_PORT in listeners and any(not value.startswith("127.0.0.1:") for value in listeners[COVER_PORT]):
-        step("9443 слушает не только localhost", "error")
-        return 1
     return 0 if all(checks.values()) else 1
 
 
@@ -133,17 +142,23 @@ def repair() -> int:
     generate_site(SITE_ROOT)
     write_nginx_config(domain, certificate=True, runner=runner)
     panel_ips = panel_ips_from_environment() or state.get("panel_ips", [])
-    remove_managed_firewall(state.get("created_firewall", []), runner)
+    if not panel_ips:
+        raise InstallerError("PANEL_IPS обязателен для repair: задайте IP панели в /etc/remnawave-node/config.env")
+    node_port = int(state.get("node_port", NODE_PORT))
+    remove_managed_firewall(state.get("created_firewall", []), runner, int(state.get("node_port", NODE_PORT)))
     backend = detect_backend(runner)
     ssh_port = detect_ssh_port(runner)
     if backend == "ufw":
-        plan = build_ufw_plan(panel_ips, ssh_port)
+        plan = build_ufw_plan(panel_ips, ssh_port, node_port)
     elif backend == "nftables":
-        plan = build_nft_plan(panel_ips, ssh_port)
+        input_chain = find_nft_input_chain(runner)
+        if not input_chain:
+            raise InstallerError("обнаружен nftables без inet input chain; firewall не изменён")
+        plan = build_nft_plan(panel_ips, ssh_port, node_port, input_chain)
     elif backend == "iptables":
-        plan = build_iptables_plan(panel_ips, ssh_port)
+        plan = build_iptables_plan(panel_ips, ssh_port, node_port)
     else:
-        plan = build_nft_plan(panel_ips, ssh_port)
+        plan = build_nft_plan(panel_ips, ssh_port, node_port)
     state["created_firewall"] = apply_plan(plan, runner)
     state["panel_ips"] = panel_ips
     health = check_health(runner, NODE_DIR, int(state.get("node_port", NODE_PORT)))
@@ -163,7 +178,7 @@ def set_secret() -> int:
     old_mode = env_path.stat().st_mode & 0o777
     values = dict(read_env_file(env_path))
     values["SECRET_KEY"] = first
-    content = "# Managed by Remnawave Node Installer.\n" + "\n".join(f'{key}="{value}"' for key, value in values.items()) + "\n"
+    content = "# Managed by Remnawave Node Installer.\n" + "\n".join(env_line(key, value) for key, value in values.items()) + "\n"
     write_private(env_path, content, mode=0o600)
     runner = _runner()
     try:
@@ -184,19 +199,30 @@ def update() -> int:
     state = _load_state()
     runner = _runner()
     old_image = state.get("image", NODE_IMAGE)
-    step("Загрузка новой версии образа", "running")
-    compose(runner, NODE_DIR, "pull")
+    old_id_result = runner.run(["docker", "image", "inspect", old_image, "--format", "{{.Id}}"], check=False, timeout=60)
+    old_id = old_id_result.stdout.strip() if old_id_result.returncode == 0 else ""
+    backup_tag = f"remnawave/node:installer-rollback-{int(time.time())}"
+    rollback_tagged = bool(old_id) and runner.run(["docker", "tag", old_image, backup_tag], check=False, timeout=60).returncode == 0
     try:
+        step("Загрузка новой версии образа", "running")
+        compose(runner, NODE_DIR, "pull")
         compose(runner, NODE_DIR, "up", "-d")
         health = check_health(runner, NODE_DIR, int(state.get("node_port", NODE_PORT)))
         if health.get("container") != "running":
             raise InstallerError("новый контейнер не подтвердил состояние running")
     except Exception:
-        step("Обновление не прошло; возвращаю предыдущий конфиг", "warn")
+        step("Обновление не прошло; возвращаю предыдущий образ", "warn")
         compose(runner, NODE_DIR, "down", check=False)
+        if rollback_tagged:
+            runner.run(["docker", "tag", backup_tag, old_image], check=False, timeout=60)
         compose(runner, NODE_DIR, "up", "-d", check=False)
+        if rollback_tagged:
+            runner.run(["docker", "rmi", backup_tag], check=False, timeout=60)
         raise
-    StateStore().save({**state, "image": old_image, "last_update": os.times().elapsed})
+    new_id_result = runner.run(["docker", "image", "inspect", old_image, "--format", "{{.Id}}"], check=False, timeout=60)
+    if rollback_tagged:
+        runner.run(["docker", "rmi", backup_tag], check=False, timeout=60)
+    StateStore().save({**state, "image": old_image, "image_id": new_id_result.stdout.strip(), "last_update": time.time()})
     step("Обновление", "ok")
     return 0
 
@@ -205,31 +231,32 @@ def uninstall(confirmed: bool) -> int:
     _root_check()
     state = _load_state()
     if not confirmed:
-        print("Будут удалены только ресурсы из install-state.json; Docker, Nginx и чужие правила сохранятся.")
+        print("Будут удалены только ресурсы из install-state.json; чужие файлы и правила firewall сохранятся.")
         if input("Введите UNINSTALL для продолжения: ").strip() != "UNINSTALL":
             print("Отменено.")
             return 0
     runner = _runner()
-    compose(runner, NODE_DIR, "down", check=False)
-    remove_managed_firewall(state.get("created_firewall", []), runner)
-    for path in [Path("/etc/nginx/sites-enabled/remnawave-node.conf"), Path("/etc/nginx/sites-available/remnawave-node.conf"), FAIL2BAN_CONFIG, Path("/etc/logrotate.d/remnawave-node")]:
+    if (NODE_DIR / "docker-compose.yml").exists():
+        compose(runner, NODE_DIR, "down", check=False)
+    remove_managed_firewall(state.get("created_firewall", []), runner, int(state.get("node_port", NODE_PORT)))
+    for item in reversed(state.get("backups", [])):
+        source, backup = Path(item["source"]), Path(item["backup"])
+        if backup.exists():
+            source.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(backup, source)
+    for value in sorted(state.get("created_paths", []), key=len, reverse=True):
+        path = Path(value)
         if path.is_symlink() or path.is_file():
             path.unlink(missing_ok=True)
-    wrapper = Path("/usr/local/bin/remnawave-node")
-    if not state.get("preexisting", {}).get("wrapper", False):
-        wrapper.unlink(missing_ok=True)
-    if SITE_ROOT.exists():
-        shutil.rmtree(SITE_ROOT)
-    for path in [NODE_DIR / ".env", NODE_DIR / "docker-compose.yml", NODE_DIR / ".image"]:
-        path.unlink(missing_ok=True)
-    try:
-        NODE_DIR.rmdir()
-    except OSError:
-        _ = None
-    if not state.get("preexisting", {}).get("installer_dir", False) and INSTALLER_DIR.exists():
-        shutil.rmtree(INSTALLER_DIR)
+        elif path.is_dir():
+            shutil.rmtree(path, ignore_errors=True) if path in (SITE_ROOT, INSTALLER_DIR, NODE_LOG_DIR) else path.rmdir()
+    if state.get("certificate_created") and state.get("domain"):
+        runner.run(["certbot", "delete", "--cert-name", state["domain"], "--non-interactive"], check=False, timeout=120)
+    owned_packages = list(dict.fromkeys(state.get("installed_packages", []) + state.get("docker_packages", [])))
+    if owned_packages:
+        runner.run(["apt-get", "remove", "-y", "--purge", *owned_packages], check=False, timeout=900)
     StateStore().remove()
-    print("Удалены только управляемые ресурсы. Docker, пакеты и пользовательские конфигурации сохранены.")
+    print("Удалены только ресурсы, отмеченные установщиком как созданные. Чужие файлы и firewall-правила сохранены.")
     return 0
 
 
@@ -237,9 +264,7 @@ def logs() -> int:
     _root_check()
     state = _load_state()
     runner = _runner()
-    result = compose(runner, NODE_DIR, "logs", "--tail=200", "-f", check=False)
-    print(result.stdout, end="")
-    return result.returncode
+    return runner.stream(["docker", "compose", "-f", str(NODE_DIR / "docker-compose.yml"), "logs", "--tail=200", "-f"], check=False)
 
 
 def main(argv=None) -> int:
@@ -253,9 +278,9 @@ def main(argv=None) -> int:
                 existing_result = _existing_install_menu(getattr(args, "skip_dns_check", False))
                 if existing_result >= 0:
                     return existing_result
-            domain = input("Домен ноды: ").strip()
+            domain = _read_interactive("Домен ноды: ")
             normalize_domain(domain)
-            secret = getpass.getpass("Ключ ноды из панели Remnawave: ")
+            secret = _read_interactive("Ключ ноды из панели Remnawave: ", secret=True)
             if not secret:
                 raise InstallerError("ключ не может быть пустым")
             return install(domain, secret, skip_dns=getattr(args, "skip_dns_check", False))

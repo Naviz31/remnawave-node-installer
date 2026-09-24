@@ -1,9 +1,7 @@
-import ipaddress
 import os
 import platform
 import shutil
 import subprocess
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
@@ -48,6 +46,30 @@ class CommandRunner:
 
     def exists(self, command: str) -> bool:
         return shutil.which(command) is not None
+
+    def stream(self, args: Sequence[str], *, check: bool = True, timeout: Optional[int] = None, env: Optional[Dict[str, str]] = None) -> int:
+        """Run a long-lived command with its stdout/stderr connected to the terminal."""
+        shown = redact(" ".join(args), self.secrets)
+        if self.logger:
+            self.logger.info("$ %s", shown)
+        try:
+            process = subprocess.Popen(args, env=env)
+            returncode = process.wait(timeout=timeout)
+        except KeyboardInterrupt:
+            process.terminate()
+            process.wait(timeout=5)
+            return 130
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            if "process" in locals() and process.poll() is None:
+                process.kill()
+                process.wait()
+            message = redact(str(exc), self.secrets)
+            if self.logger:
+                self.logger.error("stream command error: %s", message)
+            raise InstallerError(message, stage="command") from exc
+        if check and returncode != 0:
+            raise InstallerError(f"команда завершилась с кодом {returncode}: {shown}", stage="command")
+        return returncode
 
 
 def read_os_release(path: Path = Path("/etc/os-release")) -> Dict[str, str]:
@@ -98,49 +120,6 @@ def port_listeners(runner: CommandRunner) -> Dict[int, List[str]]:
     return listeners
 
 
-def established_peers(runner: CommandRunner, local_port: int) -> List[str]:
-    """Return remote IPs of established TCP sessions accepted on local_port."""
-    result = runner.run(["ss", "-tnH"], check=False, timeout=10)
-    peers = []
-    for line in result.stdout.splitlines():
-        fields = line.split()
-        if len(fields) < 5 or fields[0].upper() != "ESTAB":
-            continue
-        local_endpoint, peer_endpoint = fields[3], fields[4]
-        try:
-            if int(local_endpoint.rsplit(":", 1)[1].strip("]")) != local_port:
-                continue
-            peer_host = peer_endpoint.rsplit(":", 1)[0].strip("[]")
-            address = ipaddress.ip_address(peer_host)
-        except (ValueError, IndexError):
-            continue
-        if address.is_loopback:
-            continue
-        if str(address) not in peers:
-            peers.append(str(address))
-    return peers
-
-
-def discover_established_peers(runner: CommandRunner, local_port: int, *, attempts: int = 6, interval: int = 5) -> List[str]:
-    """Give the panel a short window to connect, then return stable peer IPs."""
-    previous = []
-    stable_rounds = 0
-    for attempt in range(attempts):
-        current = established_peers(runner, local_port)
-        if current and current == previous:
-            stable_rounds += 1
-        elif current:
-            stable_rounds = 1
-        else:
-            stable_rounds = 0
-        if stable_rounds >= 2:
-            return current
-        previous = current
-        if attempt + 1 < attempts:
-            time.sleep(interval)
-    return previous if stable_rounds >= 2 else []
-
-
 def is_service_active(runner: CommandRunner, service: str) -> bool:
     result = runner.run(["systemctl", "is-active", "--quiet", service], check=False, timeout=10)
     return result.returncode == 0
@@ -149,3 +128,10 @@ def is_service_active(runner: CommandRunner, service: str) -> bool:
 def package_installed(package: str) -> bool:
     result = subprocess.run(["dpkg-query", "-W", "-f=${Status}", package], capture_output=True, text=True)
     return result.returncode == 0 and "install ok installed" in result.stdout
+
+
+def installed_packages() -> List[str]:
+    result = subprocess.run(["dpkg-query", "-W", "-f=${binary:Package} ${Status}\n"], capture_output=True, text=True)
+    if result.returncode != 0:
+        return []
+    return [line.split(" ", 1)[0] for line in result.stdout.splitlines() if line.endswith("install ok installed")]

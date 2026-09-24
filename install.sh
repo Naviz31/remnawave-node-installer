@@ -50,4 +50,7 @@ command -v python3 >/dev/null 2>&1 || {
 }
 
 export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+if [[ -r /dev/tty ]]; then
+  exec python3 -m remnawave_node.cli "${@:-install}" </dev/tty
+fi
 exec python3 -m remnawave_node.cli "${@:-install}"

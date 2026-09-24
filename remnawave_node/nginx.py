@@ -1,11 +1,11 @@
 from pathlib import Path
 
-from .constants import COVER_PORT, NGINX_AVAILABLE, NGINX_ENABLED
+from .constants import COVER_SOCKET, NGINX_AVAILABLE, NGINX_ENABLED
 from .system import CommandRunner
 
 
 def nginx_config(domain: str, *, certificate: bool) -> str:
-    backend_listen = f"listen 127.0.0.1:{COVER_PORT} ssl;" if certificate else f"listen 127.0.0.1:{COVER_PORT};"
+    backend_listen = f"listen unix:{COVER_SOCKET} ssl;" if certificate else f"listen unix:{COVER_SOCKET};"
     ssl_block = f'''\n    ssl_certificate /etc/letsencrypt/live/{domain}/fullchain.pem;\n    ssl_certificate_key /etc/letsencrypt/live/{domain}/privkey.pem;\n    ssl_protocols TLSv1.2 TLSv1.3;\n    ssl_session_cache shared:SSL:10m;\n''' if certificate else f"\n    # TLS is enabled after the HTTP-01 certificate is issued.\n"
     return f'''server_tokens off;
 

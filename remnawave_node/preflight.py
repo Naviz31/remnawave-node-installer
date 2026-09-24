@@ -1,11 +1,15 @@
+import os
+import platform
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
-from .constants import COVER_PORT, FAIL2BAN_CONFIG, NGINX_AVAILABLE, NODE_DIR, NODE_PORT, SUPPORTED_OS
+from .constants import COVER_SOCKET, FAIL2BAN_CONFIG, LOGROTATE_CONFIG, NGINX_AVAILABLE, NGINX_ENABLED, NODE_DIR, NODE_PORT, RENEWAL_HOOK, SUPPORTED_OS
 from .errors import PreflightError
 from .system import CommandRunner, memory_bytes, port_listeners, public_ip, read_os_release
 from .validators import domain_points_to, normalize_domain
+from .website import SITE_ROOT
 
 
 @dataclass
@@ -22,7 +26,7 @@ class PreflightReport:
 def run_preflight(domain: str, *, runner: CommandRunner, skip_dns: bool = False, node_port: int = NODE_PORT) -> PreflightReport:
     domain = normalize_domain(domain)
     report = PreflightReport(domain=domain)
-    if hasattr(__import__("os"), "geteuid") and __import__("os").geteuid() != 0:
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
         raise PreflightError("запустите установщик от root", stage="preflight")
     os_data = read_os_release()
     report.os_name = os_data.get("ID", "unknown")
@@ -35,7 +39,7 @@ def run_preflight(domain: str, *, runner: CommandRunner, skip_dns: bool = False,
         raise PreflightError(f"архитектура {platform.machine()} не поддерживается", stage="preflight")
     if memory_bytes() and memory_bytes() < 1024 * 1024 * 1024:
         raise PreflightError("нужно минимум 1 ГБ RAM", stage="preflight")
-    usage = __import__("shutil").disk_usage("/")
+    usage = shutil.disk_usage("/")
     if usage.free < 5 * 1024 * 1024 * 1024:
         raise PreflightError("нужно минимум 5 ГБ свободного места", stage="preflight")
     if not runner.exists("curl"):
@@ -54,16 +58,14 @@ def run_preflight(domain: str, *, runner: CommandRunner, skip_dns: bool = False,
     else:
         report.warnings.append("DNS-проверка пропущена по флагу")
     listeners = port_listeners(runner)
-    for port in (80, 443, COVER_PORT):
+    for port in (80, 443):
         if port in listeners:
             raise PreflightError(f"порт {port} уже занят ({', '.join(listeners[port])}); установка остановлена до изменений", stage="preflight")
-    for managed_path in (NODE_DIR / ".env", NODE_DIR / "docker-compose.yml", NGINX_AVAILABLE, FAIL2BAN_CONFIG):
+    for managed_path in (NODE_DIR / ".env", NODE_DIR / "docker-compose.yml", NGINX_AVAILABLE, NGINX_ENABLED, FAIL2BAN_CONFIG, LOGROTATE_CONFIG, RENEWAL_HOOK, SITE_ROOT, Path(COVER_SOCKET)):
         if managed_path.exists():
             raise PreflightError(f"управляемый путь уже существует: {managed_path}; используйте status/repair или сначала завершите старую установку", stage="preflight")
     if node_port in listeners:
-        report.warnings.append(f"NODE_PORT {node_port} уже слушается; будет использован существующий порт")
-    if COVER_PORT in listeners:
-        report.warnings.append(f"локальный порт {COVER_PORT} уже занят")
+        raise PreflightError(f"порт Node API {node_port} уже занят ({', '.join(listeners[node_port])}); установка остановлена до изменений", stage="preflight")
     report.checks.extend([
         ("root", "ok"),
         ("supported OS", "ok"),

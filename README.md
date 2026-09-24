@@ -9,28 +9,27 @@
 | 🌐 Домен | FQDN, например `node.example.com` |
 | 🔐 Ключ ноды | Значение `SECRET_KEY`, скопированное из Remnawave Panel |
 
-Остальные параметры имеют безопасные значения по умолчанию и настраиваются через окружение или локальный конфигурационный файл.
+IP панели задаётся до запуска в серверном конфиге. Это намеренно: установщик не открывает `NODE_PORT` для первого подключения и не пытается угадывать панель по TCP peer.
 
 ## ⚡ Быстрый запуск
 
-IP панели обычно определяется автоматически: после запуска `remnanode` установщик коротко отслеживает фактическое входящее TCP-соединение на `NODE_PORT`, запоминает peer IP и затем создаёт firewall-правило только для него.
-
-Поэтому обычная установка запускается одной командой и не требует `PANEL_IPS`:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/Naviz31/remnawave-node-installer/main/install.sh | sudo bash
-```
-
-`PANEL_IPS` остаётся необязательным override для случаев, когда панель подключается через NAT/CDN, имеет несколько исходящих IP или ещё не успела подключиться во время окна обнаружения:
+Сначала один раз укажите публичный исходящий IP панели:
 
 ```bash
 sudo install -d -m 0755 /etc/remnawave-node
 printf 'PANEL_IPS=203.0.113.10\n' | sudo tee /etc/remnawave-node/config.env >/dev/null
 sudo chmod 0644 /etc/remnawave-node/config.env
+curl -fsSL https://raw.githubusercontent.com/Naviz31/remnawave-node-installer/main/install.sh | sudo bash
+```
+
+После этого установщик интерактивно запросит только домен и ключ ноды. Для нескольких адресов используйте запятую:
+
+```bash
+printf 'PANEL_IPS=203.0.113.10,2001:db8::10\n' | sudo tee /etc/remnawave-node/config.env >/dev/null
 sudo remnawave-node repair
 ```
 
-Если соединение панели не обнаружено, установщик не открывает `NODE_PORT` всему интернету: он завершает установку с закрытым портом и показывает эту команду для повторной настройки.
+Если не хотите сохранять конфиг, допустим одноразовый запуск одной командой: `curl -fsSL https://raw.githubusercontent.com/Naviz31/remnawave-node-installer/main/install.sh | sudo env PANEL_IPS="203.0.113.10" bash`. Установщик всё равно спросит домен и ключ.
 
 > ⚠️ Для выпуска сертификата A-запись домена должна указывать на публичный IPv4 этого VPS. Проверка DNS включена по умолчанию.
 
@@ -68,7 +67,7 @@ Logrotate → Health checks → install-state.json
                 proxy traffic   ordinary HTTPS
                                     │
                                     ▼
-                         127.0.0.1:9443
+                         /dev/shm/nginx.sock
                                     │
                                   Nginx
                            neutral cover site
@@ -80,7 +79,7 @@ Logrotate → Health checks → install-state.json
 | `:2222` | API ноды; разрешён только для `PANEL_IPS` |
 | `:80` | HTTP-01 challenge и статический сайт |
 | `:443` | после Config Profile обслуживается Node/Xray |
-| `127.0.0.1:9443` | локальный HTTPS backend для self-steal/fallback |
+| `/dev/shm/nginx.sock` | локальный Nginx backend для self-steal/fallback |
 | `/opt/remnanode/.env` | ключ и порт, права `0600` |
 
 ### Важная граница ответственности
@@ -90,7 +89,7 @@ Logrotate → Health checks → install-state.json
 Для сценария Reality Self-Steal Config Profile должен направлять ordinary HTTPS/fallback на:
 
 ```text
-127.0.0.1:9443
+/dev/shm/nginx.sock
 ```
 
 После установки нода может отображаться как работающая, а Xray — как ожидающий Config Profile. Это означает, что окружение готово, но профиль ещё не назначен в панели.
@@ -98,10 +97,9 @@ Logrotate → Health checks → install-state.json
 ## 🔐 Firewall и SSH
 
 - существующая UFW не сбрасывается и не заменяется;
-- при nftables создаётся отдельная таблица `remnawave_node`;
+- при nftables используется существующая `inet input` chain, если она есть;
 - при iptables создаётся отдельная цепочка `REMNAWAVE_NODE`;
-- `ESTABLISHED,RELATED` и текущий SSH-порт разрешаются до остальных правил;
-- `9443` не открывается наружу и дополнительно слушает только localhost;
+- iptables-jump матчится только на `NODE_PORT`, поэтому правила SSH/HTTP/HTTPS администратора не обходятся;
 - `NODE_PORT` не открывается всему интернету;
 - Fail2ban получает отдельный jail для SSH и не перезаписывает чужие jail;
 - опасные операции `iptables -F`, `nft flush ruleset` и `ufw reset` не используются.
@@ -130,7 +128,7 @@ sudo remnawave-node uninstall
 
 | Переменная | По умолчанию | Назначение |
 |---|---:|---|
-| `PANEL_IPS` | авто | один или несколько IP панели через запятую; отключает автоопределение |
+| `PANEL_IPS` | обязательно | один или несколько IP панели через запятую; лучше хранить в `/etc/remnawave-node/config.env` |
 | `PANEL_IP` | пусто | совместимый короткий вариант для одного IP |
 | `NODE_PORT` | `2222` | внутренний API-порт ноды; `61001` зарезервирован |
 | `REMNAWAVE_NODE_FAIL_AT` | пусто | тестовая инъекция ошибки на этапе установки |
@@ -162,7 +160,7 @@ REMNAWAVE_NODE_FAIL_AT=nginx sudo -E bash install.sh
 - созданные сертификаты и hook renewal;
 - результаты health check.
 
-При rollback существовавшие Docker/Nginx/Fail2ban, сертификаты и чужие firewall rules не удаляются.
+При rollback удаляются только пакеты, Docker и сертификат, созданные именно этой транзакцией; сервисы возвращаются к исходным состояниям. Существовавшие каталоги сайта, Nginx/hook-файлы и чужие firewall rules не удаляются.
 
 ## 🌐 TLS и cover website
 
@@ -177,7 +175,7 @@ REMNAWAVE_NODE_FAIL_AT=nginx sudo -E bash install.sh
 - root-доступ и systemd;
 - минимум 1 ГБ RAM, 1 CPU и 5 ГБ свободного места;
 - DNS A-запись домена на VPS;
-- свободные порты `80`, `443`, `2222` и `9443`;
+- свободные порты `80`, `443` и `2222`;
 - исходящий доступ в интернет.
 
 Docker Engine и Compose plugin устанавливаются автоматически, если их нет. Уже установленный Docker переиспользуется.
@@ -220,7 +218,7 @@ remnawave-node-installer/
 │   ├── state.py               # manifest, backup, rollback state
 │   ├── compose.py             # docker-compose и закрытый .env
 │   ├── firewall.py            # UFW/nftables/iptables без destructive reset
-│   ├── nginx.py               # HTTP и localhost HTTPS backend
+│   ├── nginx.py               # HTTP и Unix-socket backend
 │   ├── website.py             # локальный нейтральный сайт
 │   ├── certificates.py        # certbot и renewal hook
 │   ├── ssh_guard.py            # Fail2ban SSH jail

@@ -1,6 +1,5 @@
 import os
 import shutil
-import subprocess
 from pathlib import Path
 from typing import List, Optional
 
@@ -9,7 +8,6 @@ from .compose import compose, write_node_config
 from .constants import (
     APP_NAME,
     BACKUP_DIR,
-    COVER_PORT,
     FAIL2BAN_CONFIG,
     INSTALLER_DIR,
     INSTALLER_LOG,
@@ -18,10 +16,11 @@ from .constants import (
     NODE_IMAGE,
     NODE_LOG_DIR,
     NODE_PORT,
+    RENEWAL_HOOK,
     STATE_FILE,
 )
 from .errors import InstallerError
-from .firewall import apply_plan, build_iptables_plan, build_nft_plan, build_ufw_plan, detect_backend
+from .firewall import apply_plan, build_iptables_plan, build_nft_plan, detect_backend, find_nft_input_chain
 from .health import check_health
 from .logging_utils import configure_logger
 from .nginx import write_nginx_config
@@ -29,7 +28,7 @@ from .preflight import PreflightReport, run_preflight
 from .security import env_line, read_env_file, write_private
 from .ssh_guard import configure_fail2ban, detect_ssh_port
 from .state import InstallTransaction, StateStore
-from .system import CommandRunner, discover_established_peers, is_service_active, package_installed
+from .system import CommandRunner, installed_packages, is_service_active, package_installed
 from .ui import error_box, kv, step, title
 from .validators import parse_ips, valid_port
 from .website import SITE_ROOT, generate_site
@@ -42,7 +41,10 @@ def panel_ips_from_environment() -> List[str]:
     candidates.extend([values.get("PANEL_IPS", ""), values.get("PANEL_IP", "")])
     for candidate in candidates:
         if candidate.strip():
-            return parse_ips(candidate)
+            try:
+                return parse_ips(candidate)
+            except ValueError as exc:
+                raise InstallerError(str(exc), stage="preflight") from exc
     return []
 
 
@@ -62,10 +64,10 @@ def install_packages(runner: CommandRunner, tx: InstallTransaction) -> None:
     packages = ["ca-certificates", "curl", "dnsutils", "fail2ban", "logrotate", "nginx", "certbot", "iproute2"]
     missing = [name for name in packages if not package_installed(name)]
     if missing:
+        tx.data.setdefault("installed_packages", []).extend(name for name in missing if name not in tx.data.get("installed_packages", []))
+        tx.state.save(tx.data)
         runner.run(["apt-get", "update"], timeout=600)
         runner.run(["apt-get", "install", "-y", *missing], timeout=900)
-        for package in missing:
-            tx.data.setdefault("installed_packages", []).append(package)
         tx.state.save(tx.data)
 
 
@@ -73,9 +75,14 @@ def ensure_docker(runner: CommandRunner, tx: InstallTransaction) -> None:
     existed = runner.exists("docker") and runner.run(["docker", "info"], check=False, timeout=60).returncode == 0
     tx.mark_preexisting("docker", existed)
     if not runner.exists("docker"):
-        runner.run(["sh", "-c", "curl -fsSL https://get.docker.com | sh"], timeout=900)
+        before = set(installed_packages())
         tx.data["docker_installed_by_installer"] = True
         tx.state.save(tx.data)
+        try:
+            runner.run(["sh", "-c", "curl -fsSL https://get.docker.com | sh"], timeout=900)
+        finally:
+            tx.data["docker_packages"] = sorted(set(installed_packages()) - before)
+            tx.state.save(tx.data)
     runner.run(["systemctl", "enable", "--now", "docker"], timeout=60)
     runner.run(["docker", "info"], timeout=60)
     runner.run(["docker", "compose", "version"], timeout=60)
@@ -106,12 +113,14 @@ def install_persistent_cli(tx: InstallTransaction) -> None:
 
 
 def write_logrotate(tx: InstallTransaction) -> None:
-    if LOGROTATE_CONFIG.exists():
+    existed = LOGROTATE_CONFIG.exists()
+    if existed:
         tx.backup_file(LOGROTATE_CONFIG)
     LOGROTATE_CONFIG.parent.mkdir(parents=True, exist_ok=True)
     LOGROTATE_CONFIG.write_text("""/var/log/remnawave-node/*.log /var/log/remnanode/*.log {\n    daily\n    rotate 7\n    compress\n    missingok\n    notifempty\n    copytruncate\n}\n""", encoding="utf-8")
     LOGROTATE_CONFIG.chmod(0o644)
-    tx.record_path(LOGROTATE_CONFIG)
+    if not existed:
+        tx.record_path(LOGROTATE_CONFIG)
 
 
 def maybe_fail(stage: str) -> None:
@@ -120,36 +129,53 @@ def maybe_fail(stage: str) -> None:
 
 
 def rollback(tx: InstallTransaction, runner: CommandRunner) -> None:
+    errors = []
     try:
         if tx.data.get("node_started"):
             compose(runner, NODE_DIR, "down", check=False)
         if tx.data.get("created_firewall"):
             from .firewall import remove_managed_firewall
-            remove_managed_firewall(tx.data["created_firewall"], runner)
+            remove_managed_firewall(tx.data["created_firewall"], runner, int(tx.data.get("node_port", NODE_PORT)))
+        if tx.data.get("certificate_created") and tx.data.get("domain"):
+            runner.run(["certbot", "delete", "--cert-name", tx.data["domain"], "--non-interactive"], check=False, timeout=120)
         tx.restore_backups()
         for path in sorted(tx.created_paths(), key=lambda value: len(str(value)), reverse=True):
-            if path == NODE_DIR:
-                continue
             if path.is_symlink() or path.is_file():
                 path.unlink(missing_ok=True)
             elif path.is_dir():
-                if path == INSTALLER_DIR or path == SITE_ROOT:
+                if path in (INSTALLER_DIR, SITE_ROOT, NODE_LOG_DIR):
                     shutil.rmtree(path, ignore_errors=True)
                 else:
                     try:
                         path.rmdir()
                     except OSError:
                         continue
-        tx.mark_rollback()
     except Exception as exc:
-        tx.data["rollback_error"] = str(exc)
-        tx.state.save(tx.data)
+        errors.append(str(exc))
+    try:
+        before_services = tx.data.get("services_before", {})
+        for service, snapshot in before_services.items():
+            if snapshot.get("enabled"):
+                runner.run(["systemctl", "enable", service], check=False, timeout=30)
+            else:
+                runner.run(["systemctl", "disable", service], check=False, timeout=30)
+            runner.run(["systemctl", "start" if snapshot.get("active") else "stop", service], check=False, timeout=30)
+        packages = list(dict.fromkeys(tx.data.get("installed_packages", []) + tx.data.get("docker_packages", [])))
+        if packages:
+            runner.run(["apt-get", "remove", "-y", "--purge", *packages], check=False, timeout=900)
+    except Exception as exc:
+        errors.append(str(exc))
+    if errors:
+        tx.data["rollback_error"] = "; ".join(errors)
+    tx.mark_rollback()
 
 
 def install(domain: str, secret: str, *, skip_dns: bool = False) -> int:
     logger = configure_logger(INSTALLER_LOG, [secret])
     runner = CommandRunner(logger, [secret])
     panel_ips = panel_ips_from_environment()
+    if not panel_ips:
+        raise InstallerError("PANEL_IPS обязателен: укажите IP панели в /etc/remnawave-node/config.env или переменной окружения", stage="preflight")
     node_port = node_port_from_environment()
     tx = InstallTransaction()
     try:
@@ -161,6 +187,11 @@ def install(domain: str, secret: str, *, skip_dns: bool = False) -> int:
             for warning in report.warnings:
                 step(warning, "warn")
         tx.begin(domain=report.domain, node_port=node_port, image=NODE_IMAGE, panel_ips=panel_ips)
+        tx.data["services_before"] = {
+            name: {"active": is_service_active(runner, name), "enabled": runner.run(["systemctl", "is-enabled", "--quiet", name], check=False, timeout=10).returncode == 0}
+            for name in ("docker", "nginx", "fail2ban")
+        }
+        tx.state.save(tx.data)
         install_persistent_cli(tx)
         for path, key in ((NODE_DIR, "node_dir"), (Path("/etc/nginx"), "nginx"), (Path("/etc/fail2ban"), "fail2ban")):
             tx.mark_preexisting(key, path.exists())
@@ -177,8 +208,10 @@ def install(domain: str, secret: str, *, skip_dns: bool = False) -> int:
 
         maybe_fail("node")
         step("Remnawave Node", "running")
+        log_dir_existed = NODE_LOG_DIR.exists()
         NODE_LOG_DIR.mkdir(parents=True, exist_ok=True)
-        tx.record_path(NODE_LOG_DIR)
+        if not log_dir_existed:
+            tx.record_path(NODE_LOG_DIR)
         NODE_DIR.mkdir(parents=True, exist_ok=True)
         tx.record_path(NODE_DIR / ".env")
         tx.record_path(NODE_DIR / "docker-compose.yml")
@@ -189,16 +222,6 @@ def install(domain: str, secret: str, *, skip_dns: bool = False) -> int:
         tx.state.save(tx.data)
         step("Remnawave Node", "ok")
 
-        if not panel_ips:
-            step("Определение IP панели по входящему соединению", "running")
-            panel_ips = discover_established_peers(runner, node_port)
-            if panel_ips:
-                step(f"IP панели найден: {', '.join(panel_ips)}", "ok")
-            else:
-                step("IP панели не обнаружен; NODE_PORT будет закрыт до ручной настройки", "warn")
-            tx.data["panel_ips"] = panel_ips
-            tx.state.save(tx.data)
-
         maybe_fail("firewall")
         step("Firewall", "running")
         backend = detect_backend(runner)
@@ -206,7 +229,10 @@ def install(domain: str, secret: str, *, skip_dns: bool = False) -> int:
         if backend == "ufw":
             plan = build_ufw_plan(panel_ips, ssh_port, node_port)
         elif backend == "nftables":
-            plan = build_nft_plan(panel_ips, ssh_port, node_port)
+            input_chain = find_nft_input_chain(runner)
+            if not input_chain:
+                raise InstallerError("обнаружен nftables без inet input chain; firewall не изменён, настройте правило Node API вручную", stage="firewall")
+            plan = build_nft_plan(panel_ips, ssh_port, node_port, input_chain)
         elif backend == "iptables":
             plan = build_iptables_plan(panel_ips, ssh_port, node_port)
         else:
@@ -222,8 +248,10 @@ def install(domain: str, secret: str, *, skip_dns: bool = False) -> int:
 
         maybe_fail("ssh")
         step("SSH protection", "running")
+        fail2ban_existed = FAIL2BAN_CONFIG.exists()
         if configure_fail2ban(runner, tx.backup_file):
-            tx.record_path(FAIL2BAN_CONFIG)
+            if not fail2ban_existed:
+                tx.record_path(FAIL2BAN_CONFIG)
         else:
             step("Fail2ban не найден; существующая SSH-конфигурация не изменена", "warn")
         step("SSH protection", "ok")
@@ -241,9 +269,9 @@ def install(domain: str, secret: str, *, skip_dns: bool = False) -> int:
         step("TLS certificate", "running")
         cert_created = issue_certificate(report.domain, runner)
         tx.data["certificate_created"] = cert_created
-        write_nginx_config(report.domain, certificate=True, runner=runner, backup=tx.backup_file)
+        write_nginx_config(report.domain, certificate=True, runner=runner)
         install_renewal_hook(report.domain, runner)
-        tx.record_path(Path("/etc/letsencrypt/renewal-hooks/deploy/remnawave-node-reload"))
+        tx.record_path(RENEWAL_HOOK)
         step("TLS certificate", "ok")
 
         maybe_fail("logs")
@@ -265,13 +293,11 @@ def install(domain: str, secret: str, *, skip_dns: bool = False) -> int:
         kv("Домен", report.domain)
         kv("Публичный IPv4", report.public_ipv4 or "не определён", "warn" if not report.public_ipv4 else "ok")
         kv("Node API", f":{node_port} / только IP панели")
-        kv("Cover backend", f"127.0.0.1:{COVER_PORT}")
+        kv("Cover backend", "/dev/shm/nginx.sock")
         kv("TLS", "валидирован")
         kv("Remnawave Node", "контейнер запущен")
         if health.get("xray") == "waiting-for-panel-config":
             step("Xray ждёт Config Profile из панели — это нормально до настройки узла", "warn")
-        if not panel_ips:
-            step("PANEL_IPS не задан: добавьте IP панели в /etc/remnawave-node/config.env и выполните repair", "warn")
         print("\nКоманды: remnawave-node status · doctor · repair · logs")
         return 0
     except KeyboardInterrupt as exc:

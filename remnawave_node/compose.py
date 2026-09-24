@@ -22,6 +22,7 @@ def compose_text(image: str = NODE_IMAGE) -> str:
         hard: 1048576
     volumes:
       - /var/log/remnanode:/var/log/remnanode
+      - /dev/shm:/dev/shm:rw
 '''
 
 
