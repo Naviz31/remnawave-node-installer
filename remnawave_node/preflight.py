@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
-from .constants import COVER_SOCKET, FAIL2BAN_CONFIG, LOGROTATE_CONFIG, NGINX_AVAILABLE, NGINX_ENABLED, NODE_DIR, NODE_PORT, RENEWAL_HOOK, SUPPORTED_DISTROS
+from .constants import COVER_SOCKET, DEFAULT_TLS_MODE, FAIL2BAN_CONFIG, LOGROTATE_CONFIG, NGINX_AVAILABLE, NGINX_ENABLED, NODE_DIR, NODE_PORT, RENEWAL_HOOK, SUPPORTED_DISTROS, TLS_MODE_NGINX_WS
 from .errors import PreflightError
 from .system import CommandRunner, memory_bytes, port_listeners, public_ip, read_os_release
 from .validators import domain_points_to, normalize_domain
@@ -23,7 +23,15 @@ class PreflightReport:
     checks: List[tuple] = field(default_factory=list)
 
 
-def run_preflight(domain: str, *, runner: CommandRunner, skip_dns: bool = False, node_port: int = NODE_PORT) -> PreflightReport:
+def run_preflight(
+    domain: str,
+    *,
+    runner: CommandRunner,
+    skip_dns: bool = False,
+    node_port: int = NODE_PORT,
+    tls_mode: str = DEFAULT_TLS_MODE,
+    ws_proxy_port: Optional[int] = None,
+) -> PreflightReport:
     domain = normalize_domain(domain)
     report = PreflightReport(domain=domain)
     if hasattr(os, "geteuid") and os.geteuid() != 0:
@@ -66,6 +74,11 @@ def run_preflight(domain: str, *, runner: CommandRunner, skip_dns: bool = False,
             raise PreflightError(f"управляемый путь уже существует: {managed_path}; используйте status/repair или сначала завершите старую установку", stage="preflight")
     if node_port in listeners:
         raise PreflightError(f"порт Node API {node_port} уже занят ({', '.join(listeners[node_port])}); установка остановлена до изменений", stage="preflight")
+    if tls_mode == TLS_MODE_NGINX_WS and ws_proxy_port in listeners:
+        raise PreflightError(
+            f"порт VLESS/WS backend {ws_proxy_port} уже занят ({', '.join(listeners[ws_proxy_port])}); установка остановлена до изменений",
+            stage="preflight",
+        )
     report.checks.extend([
         ("root", "ok"),
         ("supported OS", "ok"),

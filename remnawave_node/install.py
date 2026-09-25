@@ -8,6 +8,8 @@ from .compose import compose, write_node_config
 from .constants import (
     APP_NAME,
     COVER_SOCKET,
+    DEFAULT_TLS_MODE,
+    DEFAULT_WS_PROXY_PORT,
     INSTALLER_DIR,
     INSTALLER_LOG,
     LOGROTATE_CONFIG,
@@ -15,6 +17,7 @@ from .constants import (
     NODE_IMAGE,
     NODE_LOG_DIR,
     NODE_PORT,
+    TLS_MODE_NGINX_WS,
 )
 from .errors import InstallerError
 from .firewall import apply_plan, build_iptables_plan, build_nft_plan, build_ufw_plan, detect_backend, find_nft_input_chain, iptables_ipv6_available
@@ -54,6 +57,28 @@ def node_port_from_environment() -> int:
         raise InstallerError("NODE_PORT должен быть числом", stage="preflight") from exc
     if not valid_port(value) or value == 61001:
         raise InstallerError("NODE_PORT должен быть портом 1-65535 и не может быть 61001", stage="preflight")
+    return value
+
+
+def tls_mode_from_environment() -> Optional[str]:
+    config = dict(read_env_file(Path("/etc/remnawave-node/config.env")))
+    value = os.environ.get("TLS_MODE", config.get("TLS_MODE", "")).strip().lower()
+    if not value:
+        return None
+    if value not in {DEFAULT_TLS_MODE, TLS_MODE_NGINX_WS}:
+        raise InstallerError("TLS_MODE должен быть xray или nginx-ws", stage="preflight")
+    return value
+
+
+def ws_proxy_port_from_environment(node_port: int = NODE_PORT) -> int:
+    config = dict(read_env_file(Path("/etc/remnawave-node/config.env")))
+    raw = os.environ.get("WS_PROXY_PORT", config.get("WS_PROXY_PORT", str(DEFAULT_WS_PROXY_PORT)))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise InstallerError("WS_PROXY_PORT должен быть числом", stage="preflight") from exc
+    if not valid_port(value) or value in {80, 443, 61001, node_port}:
+        raise InstallerError("WS_PROXY_PORT должен быть портом 1-65535, кроме 80, 443, 61001 и NODE_PORT", stage="preflight")
     return value
 
 
@@ -174,23 +199,50 @@ def rollback(tx: InstallTransaction, runner: CommandRunner) -> None:
     tx.mark_rollback()
 
 
-def install(domain: str, secret: str, *, panel_ips: Optional[List[str]] = None, skip_dns: bool = False) -> int:
+def install(
+    domain: str,
+    secret: str,
+    *,
+    panel_ips: Optional[List[str]] = None,
+    skip_dns: bool = False,
+    tls_mode: str = DEFAULT_TLS_MODE,
+    ws_proxy_port: Optional[int] = None,
+) -> int:
     logger = configure_logger(INSTALLER_LOG, [secret])
     runner = CommandRunner(logger, [secret])
     panel_ips = panel_ips or panel_ips_from_environment()
     if not panel_ips:
         raise InstallerError("PANEL_IPS обязателен: укажите IP панели в /etc/remnawave-node/config.env или переменной окружения", stage="preflight")
     node_port = node_port_from_environment()
+    tls_mode = tls_mode.strip().lower()
+    if tls_mode not in {DEFAULT_TLS_MODE, TLS_MODE_NGINX_WS}:
+        raise InstallerError("TLS_MODE должен быть xray или nginx-ws", stage="preflight")
+    if tls_mode == TLS_MODE_NGINX_WS:
+        ws_proxy_port = ws_proxy_port if ws_proxy_port is not None else ws_proxy_port_from_environment(node_port)
+        if not valid_port(ws_proxy_port) or ws_proxy_port in {80, 443, 61001, node_port}:
+            raise InstallerError("WS_PROXY_PORT должен быть портом 1-65535, кроме 80, 443, 61001 и NODE_PORT", stage="preflight")
+    else:
+        ws_proxy_port = DEFAULT_WS_PROXY_PORT
     tx = InstallTransaction()
     try:
         title(APP_NAME)
         step("Preflight", "running")
-        report = run_preflight(domain, runner=runner, skip_dns=skip_dns, node_port=node_port)
+        report = run_preflight(
+            domain,
+            runner=runner,
+            skip_dns=skip_dns,
+            node_port=node_port,
+            tls_mode=tls_mode,
+            ws_proxy_port=ws_proxy_port,
+        )
         step("Preflight", "ok")
         if report.warnings:
             for warning in report.warnings:
                 step(warning, "warn")
         tx.begin(domain=report.domain, node_port=node_port, image=NODE_IMAGE, panel_ips=panel_ips)
+        tx.data["tls_mode"] = tls_mode
+        tx.data["ws_proxy_port"] = ws_proxy_port
+        tx.state.save(tx.data)
         tx.data["services_before"] = {
             name: {"active": is_service_active(runner, name), "enabled": runner.run(["systemctl", "is-enabled", "--quiet", name], check=False, timeout=10).returncode == 0}
             for name in ("docker", "nginx", "fail2ban")
@@ -264,7 +316,15 @@ def install(domain: str, secret: str, *, panel_ips: Optional[List[str]] = None, 
         step("Nginx и cover website", "running")
         generate_site(SITE_ROOT, report.domain, on_created=tx.record_path)
         tx.record_path(Path(COVER_SOCKET))
-        write_nginx_config(report.domain, certificate=False, runner=runner, backup=tx.backup_file, on_created=tx.record_path)
+        write_nginx_config(
+            report.domain,
+            certificate=False,
+            runner=runner,
+            tls_mode=tls_mode,
+            ws_proxy_port=ws_proxy_port,
+            backup=tx.backup_file,
+            on_created=tx.record_path,
+        )
         step("Nginx и cover website", "ok")
 
         maybe_fail("tls")
@@ -274,7 +334,7 @@ def install(domain: str, secret: str, *, panel_ips: Optional[List[str]] = None, 
         tx.state.save(tx.data)
         cert_created = issue_certificate(report.domain, runner)
         tx.data["certificate_created"] = cert_created
-        write_nginx_config(report.domain, certificate=True, runner=runner)
+        write_nginx_config(report.domain, certificate=True, runner=runner, tls_mode=tls_mode, ws_proxy_port=ws_proxy_port)
         if not install_renewal_hook(report.domain, runner, on_created=tx.record_path):
             step("certbot renew --dry-run не прошёл; renewal hook установлен, продолжайте с проверкой сертификата", "warn")
         step("TLS certificate", "ok")
@@ -286,12 +346,20 @@ def install(domain: str, secret: str, *, panel_ips: Optional[List[str]] = None, 
 
         maybe_fail("health")
         step("Health checks", "running")
-        health = check_health(runner, node_port=node_port, domain=report.domain)
+        health = check_health(
+            runner,
+            node_port=node_port,
+            domain=report.domain,
+            tls_mode=tls_mode,
+            ws_proxy_port=ws_proxy_port,
+        )
         tx.data["health_after_install"] = health
-        if health.get("xray") == "listening" and health.get("self_steal") == "ok":
+        if tls_mode == DEFAULT_TLS_MODE and health.get("xray") == "listening" and health.get("self_steal") == "ok":
             tx.data["xray_was_active"] = True
+        if tls_mode == TLS_MODE_NGINX_WS and health.get("ws_backend") == "listening":
+            tx.data["ws_backend_was_active"] = True
         tx.state.save(tx.data)
-        require_install_health(health)
+        require_install_health(health, tls_mode=tls_mode)
         step("Health checks", "ok")
         tx.commit()
 
@@ -301,8 +369,12 @@ def install(domain: str, secret: str, *, panel_ips: Optional[List[str]] = None, 
         kv("Node API", f":{node_port} / только IP панели")
         kv("Cover backend", "/dev/shm/nginx.sock")
         kv("TLS", "валидирован")
+        if tls_mode == TLS_MODE_NGINX_WS:
+            kv("TLS/WS ingress", f"Nginx :443 → 127.0.0.1:{ws_proxy_port}")
         kv("Remnawave Node", "контейнер запущен")
-        if health.get("xray") == "waiting-for-panel-config":
+        if tls_mode == TLS_MODE_NGINX_WS and health.get("ws_backend") == "waiting-for-panel-config":
+            step(f"VLESS/WS inbound ждёт Config Profile на 127.0.0.1:{ws_proxy_port}", "warn")
+        elif tls_mode == DEFAULT_TLS_MODE and health.get("xray") == "waiting-for-panel-config":
             step("Xray ждёт Config Profile из панели — это нормально до настройки узла", "warn")
         print("\nКоманды: remnawave-node status · doctor · repair · logs")
         return 0

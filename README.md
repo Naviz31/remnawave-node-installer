@@ -6,16 +6,17 @@
 curl -fsSL https://raw.githubusercontent.com/Naviz31/remnawave-node-installer/v1.1.0/install.sh | sudo bash
 ```
 
-Во время установки скрипт сам запросит IP панели, домен ноды и ключ `SECRET_KEY`. Для нескольких IP панели введите их через запятую. Для выхода нажмите `Ctrl+C`.
+Во время установки скрипт запросит IP панели, домен, TLS-профиль ноды и ключ `SECRET_KEY`. Для нескольких IP панели введите их через запятую. Для выхода нажмите `Ctrl+C`.
 
 Безопасный установщик Remnawave Node для чистого Ubuntu/Debian VPS.
 
-Установщик задаёт три вопроса:
+Установщик задаёт вопросы:
 
 | Поле | Что вводится |
 |---|---|
 | 🖥️ IP панели | Один или несколько IPv4/IPv6 через запятую |
 | 🌐 Домен | FQDN, например `node.example.com` |
+| 🔀 TLS-профиль | Xray/Reality напрямую на `:443` или Nginx TLS + WebSocket |
 | 🔐 Ключ ноды | Значение `SECRET_KEY`, скопированное из Remnawave Panel |
 
 IP панели используется для ограничения доступа к API ноды в firewall. Установщик не открывает `NODE_PORT` для всего интернета и не пытается угадывать панель по TCP peer.
@@ -24,7 +25,7 @@ IP панели используется для ограничения дост�
 
 Bootstrap загружает исходный код не с плавающего `main`: внутри `install.sh` зафиксированы commit и SHA-256 архива. При выпуске новой версии обновляются обе контрольные величины.
 
-Для автоматического запуска без запроса IP панели можно заранее задать `PANEL_IPS` в `/etc/remnawave-node/config.env` или передать переменную окружения.
+Для автоматического запуска можно заранее задать `PANEL_IPS` и `TLS_MODE` в `/etc/remnawave-node/config.env` или передать переменные окружения. Чтобы использовать `nginx-ws`, добавьте `TLS_MODE=nginx-ws`; порт inbound можно переопределить через `WS_PROXY_PORT`.
 
 > ⚠️ Для выпуска сертификата A-запись домена должна указывать на публичный IPv4 этого VPS. Проверка DNS включена по умолчанию.
 
@@ -51,21 +52,17 @@ Logrotate → Health checks → install-state.json
 ## 🏗 Архитектура
 
 ```text
-                         INTERNET
-                             │
-                         TCP :443
-                             ▼
-                  Remnawave Node / Xray
-                 Config Profile из панели
-                      ┌──────┴──────┐
-                      │             │
-                proxy traffic   ordinary HTTPS
-                                    │
-                                    ▼
-                         /dev/shm/nginx.sock
-                                    │
-                                  Nginx
-                           neutral cover site
+Xray/Reality mode:                 Nginx TLS + WebSocket mode:
+Internet :443                      Internet :443
+      │                                   │
+      ▼                                   ▼
+Xray / Reality                     Nginx TLS termination
+      │                              ┌────┴─────┐
+      ▼                              │          │
+/dev/shm/nginx.sock          WebSocket upgrade   ordinary HTTPS
+      │                       127.0.0.1:10000          │
+      ▼                                                  ▼
+Nginx cover website                              Nginx cover website
 ```
 
 | Компонент | Назначение |
@@ -73,8 +70,8 @@ Logrotate → Health checks → install-state.json
 | `remnanode` | контейнер `remnawave/node:3.4.1`, `network_mode: host` |
 | `:2222` | API ноды; разрешён только для `PANEL_IPS` |
 | `:80` | HTTP-01 challenge и статический сайт |
-| `:443` | после Config Profile обслуживается Node/Xray |
-| `/dev/shm/nginx.sock` | локальный Nginx backend для self-steal/fallback |
+| `:443` | Xray/Reality в режиме `xray`; Nginx с TLS и WS proxy в режиме `nginx-ws` |
+| `/dev/shm/nginx.sock` | локальный Nginx backend для Reality self-steal/fallback |
 | `/opt/remnanode/.env` | ключ и порт, права `0600` |
 
 ### Важная граница ответственности
@@ -86,6 +83,10 @@ Logrotate → Health checks → install-state.json
 ```text
 /dev/shm/nginx.sock
 ```
+
+Для профиля VLESS + WebSocket + TLS выберите режим `nginx-ws`. Nginx завершает TLS на `:443`, передаёт WebSocket-запросы в локальный порт inbound и оставляет обычный HTTPS на сайте-подложке. Путь WebSocket не зашит в конфигурацию Nginx: входящий URI проксируется без изменений. Настройте inbound в панели на `127.0.0.1:10000` с транспортом WS и без TLS, а в Host задайте TLS на `:443` и тот же WS-путь, что указан в inbound. При другом локальном порте задайте `WS_PROXY_PORT`.
+
+Режим `xray` оставляет внешний `:443` Xray и подходит для прямого Reality/XTLS и self-steal. Эти режимы используют один публичный порт, поэтому выберите режим в соответствии с Config Profile до установки.
 
 После установки нода может отображаться как работающая, а Xray — как ожидающий Config Profile. Это означает, что окружение готово, но профиль ещё не назначен в панели.
 
@@ -128,6 +129,8 @@ sudo remnawave-node uninstall
 | `PANEL_IPS` | запрашивается интерактивно | один или несколько IP панели через запятую; для автоматического запуска можно хранить в `/etc/remnawave-node/config.env` |
 | `PANEL_IP` | пусто | совместимый короткий вариант для одного IP |
 | `NODE_PORT` | `2222` | внутренний API-порт ноды; `61001` зарезервирован |
+| `TLS_MODE` | выбор при установке (`xray` по Enter) | `xray` или `nginx-ws` |
+| `WS_PROXY_PORT` | `10000` | локальный порт VLESS/WS inbound для `nginx-ws` |
 | `REMNAWAVE_NODE_FAIL_AT` | пусто | тестовая инъекция ошибки на этапе установки |
 
 Ожидаемые этапы для `REMNAWAVE_NODE_FAIL_AT`: `dependencies`, `docker`, `node`, `firewall`, `ssh`, `nginx`, `tls`, `logs`, `health`.
@@ -163,7 +166,7 @@ REMNAWAVE_NODE_FAIL_AT=nginx sudo -E bash install.sh
 
 ## 🌐 TLS и cover website
 
-Сертификат Let's Encrypt выпускается через HTTP-01 на порту `80`, после проверки DNS. Nginx не занимает внешний `443`.
+Сертификат Let's Encrypt выпускается через HTTP-01 на порту `80`, после проверки DNS. В режиме `xray` Nginx не занимает внешний `443`; в режиме `nginx-ws` Nginx слушает `:443`, завершает TLS, проксирует WebSocket upgrade в `127.0.0.1:WS_PROXY_PORT`, а обычные HTTPS-запросы отправляет на сайт-подложку.
 
 Локальный сайт генерируется из файлов репозитория, без загрузки случайных шаблонов из интернета. Он содержит страницы `/`, `/about/`, `/status/`, `/contact/`, custom `404` и `robots.txt`.
 
@@ -198,7 +201,7 @@ sudo docker compose -f /opt/remnanode/docker-compose.yml config --quiet
 sudo remnawave-node doctor
 ```
 
-Полная проверка firewall, выпуска сертификата, подключения панели и получения Config Profile требует реального VPS с DNS и Remnawave Panel. Если Xray уже слушает `:443`, команда `doctor` дополнительно делает реальный `curl https://домен/` и проверяет HTTP 200 с HTML, а не только наличие Unix socket. После первого успешного Xray/Self-Steal check состояние запоминается; последующее исчезновение `:443` становится ошибкой диагностики.
+Полная проверка firewall, выпуска сертификата, подключения панели и получения Config Profile требует реального VPS с DNS и Remnawave Panel. В режиме `xray` команда `doctor` проверяет listener на `:443` и Self-Steal HTTPS. В режиме `nginx-ws` она проверяет TLS ingress, HTTPS cover и локальный порт WS inbound; после первого появления backend его последующее исчезновение становится ошибкой диагностики.
 
 ## 📁 Структура
 
