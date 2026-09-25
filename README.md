@@ -3,7 +3,7 @@
 ## ⚡ Быстрый запуск
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Naviz31/remnawave-node-installer/v1.1.0/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/Naviz31/remnawave-node-installer/v1.2.0/install.sh | sudo bash
 ```
 
 Во время установки скрипт запросит IP панели, домен, TLS-профиль ноды и ключ `SECRET_KEY`. Для нескольких IP панели введите их через запятую. Для выхода нажмите `Ctrl+C`.
