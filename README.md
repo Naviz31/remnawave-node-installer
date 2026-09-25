@@ -1,39 +1,30 @@
 # 🌊 Remnawave Node Installer
 
+## ⚡ Быстрый запуск
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Naviz31/remnawave-node-installer/v1.1.0/install.sh | sudo bash
+```
+
+Во время установки скрипт сам запросит IP панели, домен ноды и ключ `SECRET_KEY`. Для нескольких IP панели введите их через запятую. Для выхода нажмите `Ctrl+C`.
+
 Безопасный установщик Remnawave Node для чистого Ubuntu/Debian VPS.
 
-Установщик задаёт только два вопроса:
+Установщик задаёт три вопроса:
 
 | Поле | Что вводится |
 |---|---|
+| 🖥️ IP панели | Один или несколько IPv4/IPv6 через запятую |
 | 🌐 Домен | FQDN, например `node.example.com` |
 | 🔐 Ключ ноды | Значение `SECRET_KEY`, скопированное из Remnawave Panel |
 
-IP панели задаётся до запуска в серверном конфиге. Это намеренно: установщик не открывает `NODE_PORT` для первого подключения и не пытается угадывать панель по TCP peer.
-
-## ⚡ Быстрый запуск
-
-Сначала один раз укажите публичный исходящий IP панели:
-
-```bash
-sudo install -d -m 0755 /etc/remnawave-node
-printf 'PANEL_IPS=203.0.113.10\n' | sudo tee /etc/remnawave-node/config.env >/dev/null
-sudo chmod 0644 /etc/remnawave-node/config.env
-curl -fsSL https://raw.githubusercontent.com/Naviz31/remnawave-node-installer/v1.0.9/install.sh | sudo bash
-```
-
-После этого установщик интерактивно запросит только домен и ключ ноды. Для нескольких адресов используйте запятую:
+IP панели используется для ограничения доступа к API ноды в firewall. Установщик не открывает `NODE_PORT` для всего интернета и не пытается угадывать панель по TCP peer.
 
 Ключ вводится обычной строкой и отображается на экране, поэтому после вставки из буфера обмена его значение видно сразу.
 
-```bash
-printf 'PANEL_IPS=203.0.113.10,2001:db8::10\n' | sudo tee /etc/remnawave-node/config.env >/dev/null
-sudo remnawave-node repair
-```
-
 Bootstrap загружает исходный код не с плавающего `main`: внутри `install.sh` зафиксированы commit и SHA-256 архива. При выпуске новой версии обновляются обе контрольные величины.
 
-Если не хотите сохранять конфиг, допустим одноразовый запуск одной командой: `curl -fsSL https://raw.githubusercontent.com/Naviz31/remnawave-node-installer/v1.0.9/install.sh | sudo env PANEL_IPS="203.0.113.10" bash`. Установщик всё равно спросит домен и ключ.
+Для автоматического запуска без запроса IP панели можно заранее задать `PANEL_IPS` в `/etc/remnawave-node/config.env` или передать переменную окружения.
 
 > ⚠️ Для выпуска сертификата A-запись домена должна указывать на публичный IPv4 этого VPS. Проверка DNS включена по умолчанию.
 
@@ -134,7 +125,7 @@ sudo remnawave-node uninstall
 
 | Переменная | По умолчанию | Назначение |
 |---|---:|---|
-| `PANEL_IPS` | обязательно | один или несколько IP панели через запятую; лучше хранить в `/etc/remnawave-node/config.env` |
+| `PANEL_IPS` | запрашивается интерактивно | один или несколько IP панели через запятую; для автоматического запуска можно хранить в `/etc/remnawave-node/config.env` |
 | `PANEL_IP` | пусто | совместимый короткий вариант для одного IP |
 | `NODE_PORT` | `2222` | внутренний API-порт ноды; `61001` зарезервирован |
 | `REMNAWAVE_NODE_FAIL_AT` | пусто | тестовая инъекция ошибки на этапе установки |

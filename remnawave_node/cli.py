@@ -6,7 +6,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List
 
 from . import __version__
 from .compose import compose, read_node_config, write_node_config
@@ -22,7 +22,7 @@ from .state import StateStore
 from .system import CommandRunner, read_os_release
 from .ssh_guard import detect_ssh_port
 from .ui import error_box, kv, step, title
-from .validators import normalize_domain
+from .validators import normalize_domain, parse_ips
 from .website import SITE_ROOT, generate_site
 
 
@@ -59,6 +59,22 @@ def _read_domain() -> str:
             return normalize_domain(raw)
         except ValueError as exc:
             print(f"Ошибка: {exc}. Повторите ввод {INPUT_EXIT_HINT}.", file=sys.stderr)
+
+
+def _read_panel_ips() -> List[str]:
+    configured = panel_ips_from_environment()
+    if configured:
+        return configured
+    while True:
+        raw = _read_interactive(f"IP панели (через запятую для нескольких) {INPUT_EXIT_HINT}: ")
+        try:
+            panel_ips = parse_ips(raw)
+        except ValueError as exc:
+            print(f"Ошибка: {exc}. Повторите ввод {INPUT_EXIT_HINT}.", file=sys.stderr)
+            continue
+        if panel_ips:
+            return panel_ips
+        print(f"IP панели не может быть пустым. Повторите ввод {INPUT_EXIT_HINT}.", file=sys.stderr)
 
 
 def _read_required(prompt: str) -> str:
@@ -476,9 +492,10 @@ def main(argv=None) -> int:
                 existing_result = _existing_install_menu(getattr(args, "skip_dns_check", False))
                 if existing_result >= 0:
                     return existing_result
+            panel_ips = _read_panel_ips()
             domain = _read_domain()
             secret = _read_required("Ключ ноды из панели Remnawave")
-            return install(domain, secret, skip_dns=getattr(args, "skip_dns_check", False))
+            return install(domain, secret, panel_ips=panel_ips, skip_dns=getattr(args, "skip_dns_check", False))
         if command == "status":
             return show_status()
         if command == "doctor":

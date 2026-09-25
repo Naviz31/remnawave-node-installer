@@ -1,7 +1,7 @@
 import os
 import shutil
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from .certificates import certificate_exists, install_renewal_hook, issue_certificate
 from .compose import compose, write_node_config
@@ -174,10 +174,10 @@ def rollback(tx: InstallTransaction, runner: CommandRunner) -> None:
     tx.mark_rollback()
 
 
-def install(domain: str, secret: str, *, skip_dns: bool = False) -> int:
+def install(domain: str, secret: str, *, panel_ips: Optional[List[str]] = None, skip_dns: bool = False) -> int:
     logger = configure_logger(INSTALLER_LOG, [secret])
     runner = CommandRunner(logger, [secret])
-    panel_ips = panel_ips_from_environment()
+    panel_ips = panel_ips or panel_ips_from_environment()
     if not panel_ips:
         raise InstallerError("PANEL_IPS обязателен: укажите IP панели в /etc/remnawave-node/config.env или переменной окружения", stage="preflight")
     node_port = node_port_from_environment()
