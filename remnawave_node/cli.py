@@ -10,11 +10,11 @@ from typing import Dict, List
 
 from . import __version__
 from .compose import compose, read_node_config, write_node_config
-from .constants import APP_NAME, INSTALLER_DIR, INSTALLER_LOG, NODE_DIR, NODE_IMAGE, NODE_LOG_DIR, NODE_PORT, STATE_FILE
+from .constants import APP_NAME, DEFAULT_TLS_MODE, DEFAULT_WS_PROXY_PORT, INSTALLER_DIR, INSTALLER_LOG, NODE_DIR, NODE_IMAGE, NODE_LOG_DIR, NODE_PORT, STATE_FILE, TLS_MODE_NGINX_WS
 from .errors import InstallerError
 from .firewall import apply_plan, build_iptables_plan, build_nft_plan, build_ufw_plan, detect_backend, firewall_is_applied, find_nft_input_chain, iptables_ipv6_available, remove_managed_firewall
 from .health import check_health, require_install_health
-from .install import install, panel_ips_from_environment, restore_service_states
+from .install import install, panel_ips_from_environment, restore_service_states, tls_mode_from_environment
 from .logging_utils import configure_logger
 from .nginx import write_nginx_config
 from .security import env_line, read_env_file, write_private
@@ -85,6 +85,22 @@ def _read_required(prompt: str) -> str:
         print(f"Значение не может быть пустым. Повторите ввод {INPUT_EXIT_HINT}.", file=sys.stderr)
 
 
+def _read_tls_mode() -> str:
+    configured = tls_mode_from_environment()
+    if configured:
+        return configured
+    print("\nTLS-профиль для этой ноды:")
+    print("1. Xray/Reality напрямую на :443 (по умолчанию)")
+    print("2. VLESS + WS + TLS: Nginx завершает TLS на :443 и передаёт WebSocket в локальный inbound :10000")
+    while True:
+        choice = _read_interactive(f"Выберите [1-2, Enter = 1] {INPUT_EXIT_HINT}: ").strip()
+        if choice in {"", "1"}:
+            return DEFAULT_TLS_MODE
+        if choice == "2":
+            return TLS_MODE_NGINX_WS
+        print(f"Введите 1 или 2. Повторите ввод {INPUT_EXIT_HINT}.", file=sys.stderr)
+
+
 def _read_secret_pair(first_prompt: str, second_prompt: str):
     while True:
         first = _read_required(first_prompt)
@@ -100,6 +116,8 @@ def _parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command")
     install_parser = sub.add_parser("install", help="установить и настроить Node")
     install_parser.add_argument("--skip-dns-check", action="store_true", help="пропустить проверку A/AAAA-записей")
+    install_parser.add_argument("--tls-mode", choices=(DEFAULT_TLS_MODE, TLS_MODE_NGINX_WS), help="режим TLS: Xray/Reality или Nginx TLS + WebSocket")
+    install_parser.add_argument("--ws-proxy-port", type=int, help="локальный порт VLESS/WS inbound (по умолчанию 10000)")
     sub.add_parser("status", help="показать сводный статус")
     sub.add_parser("doctor", help="запустить расширенную диагностику")
     sub.add_parser("repair", help="восстановить управляемые конфигурации")
@@ -116,6 +134,13 @@ def _load_state() -> Dict:
     if not state or state.get("status") not in {"installed", "in_progress", "repairing", "repair_failed", "rolled_back"}:
         raise InstallerError("установка Remnawave Node не найдена")
     return state
+
+
+def _state_tls_options(state: Dict) -> Dict[str, object]:
+    return {
+        "tls_mode": state.get("tls_mode", DEFAULT_TLS_MODE),
+        "ws_proxy_port": int(state.get("ws_proxy_port", DEFAULT_WS_PROXY_PORT)),
+    }
 
 
 def _existing_install_menu(skip_dns: bool) -> int:
@@ -178,7 +203,8 @@ def latest_node_image(runner: CommandRunner, current_image: str) -> str:
 def show_status() -> int:
     state = _load_state()
     runner = _runner()
-    health = check_health(runner, NODE_DIR, int(state.get("node_port", NODE_PORT)), state.get("domain"))
+    tls_options = _state_tls_options(state)
+    health = check_health(runner, NODE_DIR, int(state.get("node_port", NODE_PORT)), state.get("domain"), **tls_options)
     title(APP_NAME)
     kv("Состояние", state.get("status", "unknown"), "ok" if state.get("status") == "installed" else "warn")
     kv("Домен", state.get("domain", "не задан"))
@@ -188,8 +214,14 @@ def show_status() -> int:
     kv("Nginx", health.get("nginx", "unknown"), "ok" if health.get("nginx") == "valid" else "error")
     kv("Cover", health.get("cover_backend", "unknown"), "ok" if health.get("cover_backend") == "listening" else "warn")
     kv("Node API", health.get("node_port", "unknown"), "ok" if health.get("node_port") == "listening" else "warn")
-    kv("Self-Steal", health.get("self_steal", "unknown"), "ok" if health.get("self_steal") in {"ok", "not-checked"} else "error")
-    kv("Xray", health.get("xray", "unknown"), "ok" if health.get("xray") == "listening" else "warn")
+    if tls_options["tls_mode"] == TLS_MODE_NGINX_WS:
+        kv("TLS ingress", health.get("tls_ingress", "unknown"), "ok" if health.get("tls_ingress") == "listening" else "error")
+        kv("HTTPS cover", health.get("public_https", "unknown"), "ok" if health.get("public_https") == "ok" else "error")
+        backend_state = health.get("ws_backend", "unknown")
+        kv("WS backend", backend_state, "ok" if backend_state == "listening" else "error" if backend_state == "exposed" else "warn")
+    else:
+        kv("Self-Steal", health.get("self_steal", "unknown"), "ok" if health.get("self_steal") in {"ok", "not-checked"} else "error")
+        kv("Xray", health.get("xray", "unknown"), "ok" if health.get("xray") == "listening" else "warn")
     return 0
 
 
@@ -199,8 +231,13 @@ def doctor() -> int:
     title("Диагностика Remnawave Node")
     if state.get("status") in {"repairing", "repair_failed"}:
         step("Обнаружен незавершённый repair; запустите команду repair для восстановления", "warn")
-    health = check_health(runner, NODE_DIR, int(state.get("node_port", NODE_PORT)), state.get("domain"))
-    if health.get("xray") == "listening" and health.get("self_steal") == "ok" and not state.get("xray_was_active"):
+    tls_options = _state_tls_options(state)
+    tls_mode = tls_options["tls_mode"]
+    health = check_health(runner, NODE_DIR, int(state.get("node_port", NODE_PORT)), state.get("domain"), **tls_options)
+    if tls_mode == TLS_MODE_NGINX_WS and health.get("ws_backend") == "listening" and not state.get("ws_backend_was_active"):
+        state["ws_backend_was_active"] = True
+        StateStore().save(state)
+    if tls_mode == DEFAULT_TLS_MODE and health.get("xray") == "listening" and health.get("self_steal") == "ok" and not state.get("xray_was_active"):
         state["xray_was_active"] = True
         StateStore().save(state)
     xray_expected = bool(state.get("xray_was_active"))
@@ -213,8 +250,6 @@ def doctor() -> int:
         "nginx config": health.get("nginx") == "valid",
         "cover unix socket": health.get("cover_backend") == "listening",
         "node port": health.get("node_port") == "listening",
-        "xray listener": health.get("xray") == "listening" if xray_expected else health.get("xray") in {"listening", "waiting-for-panel-config"},
-        "self-steal HTTPS": health.get("self_steal") == "ok" if xray_expected else health.get("self_steal") in {"ok", "not-checked"},
         "firewall rules": firewall_is_applied(
             state.get("created_firewall", []),
             runner,
@@ -222,8 +257,23 @@ def doctor() -> int:
             state.get("panel_ips", []),
         ),
     }
+    critical_checks = set()
+    if tls_mode == TLS_MODE_NGINX_WS:
+        ws_expected = bool(state.get("ws_backend_was_active"))
+        checks.update({
+            "TLS ingress": health.get("tls_ingress") == "listening",
+            "HTTPS cover": health.get("public_https") == "ok",
+            "VLESS/WS backend": health.get("ws_backend") == "listening" if ws_expected else health.get("ws_backend") in {"listening", "waiting-for-panel-config"},
+        })
+        critical_checks.update({"TLS ingress", "HTTPS cover", "VLESS/WS backend"})
+    else:
+        checks.update({
+            "xray listener": health.get("xray") == "listening" if xray_expected else health.get("xray") in {"listening", "waiting-for-panel-config"},
+            "self-steal HTTPS": health.get("self_steal") == "ok" if xray_expected else health.get("self_steal") in {"ok", "not-checked"},
+        })
+        critical_checks.update({"self-steal HTTPS", "xray listener"})
     for label, passed in checks.items():
-        step(label, "ok" if passed else "error" if label in {"self-steal HTTPS", "xray listener"} else "warn")
+        step(label, "ok" if passed else "error" if label in critical_checks else "warn")
     return 0 if all(checks.values()) else 1
 
 
@@ -297,6 +347,7 @@ def repair() -> int:
     state = _load_state()
     runner = _runner()
     node_port = int(state.get("node_port", NODE_PORT))
+    tls_options = _state_tls_options(state)
     if state.get("status") in {"repairing", "repair_failed"}:
         _recover_interrupted_repair(state, runner, node_port)
     domain = normalize_domain(state["domain"])
@@ -307,7 +358,7 @@ def repair() -> int:
     write_node_config(NODE_DIR, node_port=node_port, secret=secret, image=state.get("image", NODE_IMAGE), runner=runner)
     compose(runner, NODE_DIR, "up", "-d")
     generate_site(SITE_ROOT, domain)
-    write_nginx_config(domain, certificate=True, runner=runner)
+    write_nginx_config(domain, certificate=True, runner=runner, **tls_options)
     panel_ips = panel_ips_from_environment() or state.get("panel_ips", [])
     if not panel_ips:
         raise InstallerError("PANEL_IPS обязателен для repair: задайте IP панели в /etc/remnawave-node/config.env")
@@ -341,10 +392,17 @@ def repair() -> int:
         state["firewall_backend"] = plan.backend
         state["panel_ips"] = panel_ips
         StateStore().save(state)
-        health = check_health(runner, NODE_DIR, node_port, state.get("domain"))
-        if health.get("xray") == "listening" and health.get("self_steal") == "ok":
+        health = check_health(runner, NODE_DIR, node_port, state.get("domain"), **tls_options)
+        if tls_options["tls_mode"] == DEFAULT_TLS_MODE and health.get("xray") == "listening" and health.get("self_steal") == "ok":
             state["xray_was_active"] = True
-        require_install_health(health, xray_was_active=bool(state.get("xray_was_active")))
+        if tls_options["tls_mode"] == TLS_MODE_NGINX_WS and health.get("ws_backend") == "listening":
+            state["ws_backend_was_active"] = True
+        require_install_health(
+            health,
+            xray_was_active=bool(state.get("xray_was_active")),
+            tls_mode=tls_options["tls_mode"],
+            ws_backend_was_active=bool(state.get("ws_backend_was_active")),
+        )
         state.pop("repair_previous_firewall", None)
         state["health_after_repair"] = health
         state["status"] = "installed"
@@ -387,7 +445,7 @@ def set_secret() -> int:
     runner = _runner()
     try:
         compose(runner, NODE_DIR, "up", "-d")
-        health = check_health(runner, NODE_DIR, int(state.get("node_port", NODE_PORT)), state.get("domain"))
+        health = check_health(runner, NODE_DIR, int(state.get("node_port", NODE_PORT)), state.get("domain"), **_state_tls_options(state))
         if health.get("container") != "running":
             raise InstallerError("контейнер не запустился после смены ключа")
     except Exception:
@@ -418,8 +476,14 @@ def update() -> int:
         write_node_config(NODE_DIR, node_port=int(state.get("node_port", NODE_PORT)), secret=secret, image=target_image, runner=runner)
         compose(runner, NODE_DIR, "pull")
         compose(runner, NODE_DIR, "up", "-d")
-        health = check_health(runner, NODE_DIR, int(state.get("node_port", NODE_PORT)), state.get("domain"))
-        require_install_health(health, xray_was_active=bool(state.get("xray_was_active")))
+        tls_options = _state_tls_options(state)
+        health = check_health(runner, NODE_DIR, int(state.get("node_port", NODE_PORT)), state.get("domain"), **tls_options)
+        require_install_health(
+            health,
+            xray_was_active=bool(state.get("xray_was_active")),
+            tls_mode=tls_options["tls_mode"],
+            ws_backend_was_active=bool(state.get("ws_backend_was_active")),
+        )
     except Exception:
         step("Обновление не прошло; возвращаю предыдущий образ", "warn")
         compose(runner, NODE_DIR, "down", check=False)
@@ -434,8 +498,10 @@ def update() -> int:
     if rollback_tagged:
         runner.run(["docker", "rmi", backup_tag], check=False, timeout=60)
     next_state = {**state, "image": target_image, "image_id": new_id_result.stdout.strip(), "last_update": time.time()}
-    if health.get("xray") == "listening" and health.get("self_steal") == "ok":
+    if tls_options["tls_mode"] == DEFAULT_TLS_MODE and health.get("xray") == "listening" and health.get("self_steal") == "ok":
         next_state["xray_was_active"] = True
+    if tls_options["tls_mode"] == TLS_MODE_NGINX_WS and health.get("ws_backend") == "listening":
+        next_state["ws_backend_was_active"] = True
     StateStore().save(next_state)
     step("Обновление", "ok")
     return 0
@@ -494,8 +560,17 @@ def main(argv=None) -> int:
                     return existing_result
             panel_ips = _read_panel_ips()
             domain = _read_domain()
+            tls_mode = getattr(args, "tls_mode", None) or tls_mode_from_environment() or _read_tls_mode()
+            ws_proxy_port = getattr(args, "ws_proxy_port", None)
             secret = _read_required("Ключ ноды из панели Remnawave")
-            return install(domain, secret, panel_ips=panel_ips, skip_dns=getattr(args, "skip_dns_check", False))
+            return install(
+                domain,
+                secret,
+                panel_ips=panel_ips,
+                skip_dns=getattr(args, "skip_dns_check", False),
+                tls_mode=tls_mode,
+                ws_proxy_port=ws_proxy_port,
+            )
         if command == "status":
             return show_status()
         if command == "doctor":
