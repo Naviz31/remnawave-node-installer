@@ -8,7 +8,7 @@ from typing import List, Optional
 from .constants import COVER_SOCKET, DEFAULT_TLS_MODE, FAIL2BAN_CONFIG, LOGROTATE_CONFIG, NGINX_AVAILABLE, NGINX_ENABLED, NODE_DIR, NODE_PORT, RENEWAL_HOOK, SUPPORTED_DISTROS, TLS_MODE_NGINX_WS
 from .errors import PreflightError
 from .system import CommandRunner, memory_bytes, port_listeners, public_ip, read_os_release
-from .validators import domain_points_to, normalize_domain
+from .validators import CLOUDFLARE_PROXIED_MESSAGE, domain_points_to, normalize_domain
 from .website import SITE_ROOT
 
 
@@ -63,6 +63,11 @@ def run_preflight(
             expected = report.public_ipv4 or "публичный IP"
             raise PreflightError(f"DNS-проверка не пройдена: {message}; ожидается {expected}. Используйте --skip-dns-check только осознанно", stage="preflight")
         report.checks.append(("DNS", "ok"))
+        if message == CLOUDFLARE_PROXIED_MESSAGE:
+            report.warnings.append(
+                "Домен проксируется через Cloudflare: выпуск сертификата по HTTP-01 обычно проходит, "
+                "но для Reality/Self-Steal в режиме xray переключите запись в «DNS only» (серое облако)"
+            )
     else:
         report.warnings.append("DNS-проверка пропущена по флагу")
     listeners = port_listeners(runner)

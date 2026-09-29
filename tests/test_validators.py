@@ -19,6 +19,17 @@ class ValidatorsTests(unittest.TestCase):
         with patch("remnawave_node.validators.resolve_domain", return_value=(["203.0.113.10"], [])):
             self.assertEqual(domain_points_to("node.example.com", "203.0.113.10", None), (True, "DNS указывает на сервер"))
 
+    def test_cloudflare_proxied_domain_passes(self):
+        with patch("remnawave_node.validators.resolve_domain", return_value=(["104.21.71.26", "172.67.142.109", "188.114.96.1"], [])):
+            ok, message = domain_points_to("node.example.com", "203.0.113.10", None)
+        self.assertTrue(ok)
+        self.assertIn("Cloudflare", message)
+
+    def test_mixed_cloudflare_and_foreign_ip_fails(self):
+        with patch("remnawave_node.validators.resolve_domain", return_value=(["104.21.71.26", "198.51.100.7"], [])):
+            ok, _ = domain_points_to("node.example.com", "203.0.113.10", None)
+        self.assertFalse(ok)
+
 
 if __name__ == "__main__":
     unittest.main()

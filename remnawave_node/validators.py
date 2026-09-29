@@ -7,6 +7,15 @@ from typing import List, Optional, Tuple
 from .errors import InstallerError
 
 
+CLOUDFLARE_NETWORKS = tuple(ipaddress.ip_network(item) for item in (
+    "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22", "141.101.64.0/18",
+    "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20", "197.234.240.0/22", "198.41.128.0/17",
+    "162.158.0.0/15", "104.16.0.0/13", "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+    "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32", "2405:b500::/32", "2405:8100::/32",
+    "2a06:98c0::/29", "2c0f:f248::/32",
+))
+CLOUDFLARE_PROXIED_MESSAGE = "домен проксируется через Cloudflare (реальный IP сервера скрыт, совпадение проверить нельзя)"
+
 DOMAIN_RE = re.compile(r"^(?=.{1,253}\Z)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}\Z")
 
 
@@ -78,10 +87,16 @@ def _resolve_public_dns(domain: str, runner, record_type: int) -> List[str]:
     return sorted(addresses)
 
 
+def _all_cloudflare(addresses: List[str]) -> bool:
+    return bool(addresses) and all(any(ipaddress.ip_address(item) in network for network in CLOUDFLARE_NETWORKS) for item in addresses)
+
+
 def domain_points_to(domain: str, public_ipv4: Optional[str], public_ipv6: Optional[str] = None, runner=None) -> Tuple[bool, str]:
     ipv4, ipv6 = resolve_domain(domain)
     ipv4 = sorted(set(ipv4) | set(_resolve_public_dns(domain, runner, 1)))
     ipv6 = sorted(set(ipv6) | set(_resolve_public_dns(domain, runner, 28)))
+    if _all_cloudflare(ipv4) and (not ipv6 or _all_cloudflare(ipv6)):
+        return True, CLOUDFLARE_PROXIED_MESSAGE
     if public_ipv4 and ipv4 and public_ipv4 not in ipv4:
         return False, f"A-запись не совпадает: ожидается {public_ipv4}, получено {', '.join(ipv4)}"
     if public_ipv4 and not ipv4:
