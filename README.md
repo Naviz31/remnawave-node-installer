@@ -112,6 +112,7 @@ Nginx cover website                              Nginx cover website
 | `remnawave-node doctor` | расширенная диагностика и рекомендации |
 | `remnawave-node repair` | восстановление управляемых файлов и контейнера |
 | `remnawave-node metrics` | показать данные для подключения Prometheus (адрес, фрагмент `prometheus.yml`, проверка) |
+| `remnawave-node metrics --enable --ip 198.51.100.5` | включить метрики на уже установленной ноде без переустановки: сначала правила файрвола, затем `prometheus-node-exporter`; при сбое всё откатывается |
 | `remnawave-node metrics --ip 198.51.100.5` | сменить IP сервера Prometheus: правила файрвола для `:9100` пересоздаются транзакционно с откатом при сбое |
 | `remnawave-node update` | выбор последнего стабильного semver-тега Docker Hub в текущей major-линейке, pull и rollback при ошибке |
 | `remnawave-node set-secret` | скрытая смена `SECRET_KEY` с возвратом при ошибке |

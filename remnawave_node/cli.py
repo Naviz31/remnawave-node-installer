@@ -143,7 +143,8 @@ def _parser() -> argparse.ArgumentParser:
     sub.add_parser("doctor", help="запустить расширенную диагностику")
     sub.add_parser("repair", help="восстановить управляемые конфигурации")
     metrics = sub.add_parser("metrics", help="данные для подключения Prometheus; --ip меняет разрешённый IP сервера метрик")
-    metrics.add_argument("--ip", help="новый IP сервера Prometheus (несколько через запятую)")
+    metrics.add_argument("--ip", help="IP сервера Prometheus (несколько через запятую)")
+    metrics.add_argument("--enable", action="store_true", help="установить экспортёр на уже установленной ноде (вместе с --ip)")
     uninstall = sub.add_parser("uninstall", help="удалить только ресурсы, созданные установщиком")
     uninstall.add_argument("--yes", action="store_true", help="не запрашивать подтверждение")
     sub.add_parser("update", help="обновить образ Node с rollback при ошибке")
@@ -236,13 +237,105 @@ def _print_metrics_info(state, runner, active=None) -> None:
     print_prometheus_report(node_ip, state.get("metrics_ips", []), active)
 
 
-def metrics_command(ips_raw=None) -> int:
-    """Show the Prometheus connection block, or change the collector IP(s) through a transactional repair."""
+def _prompt_prometheus_ips() -> List[str]:
+    while True:
+        raw = _read_interactive(f"IP сервера Prometheus (откуда будут забираться метрики) {INPUT_EXIT_HINT}: ")
+        try:
+            ips = parse_ips(raw)
+        except ValueError as exc:
+            print(f"Ошибка: {exc}. Повторите ввод {INPUT_EXIT_HINT}.", file=sys.stderr)
+            continue
+        if ips:
+            return ips
+        print(f"IP не может быть пустым. Повторите ввод {INPUT_EXIT_HINT}.", file=sys.stderr)
+
+
+def _undo_enable_metrics(runner, snapshot) -> None:
+    """Best-effort rollback of an interrupted `metrics --enable`: service, package, config, firewall, state."""
+    from .constants import NODE_EXPORTER_CONFIG
+    from .state import InstallTransaction
+
+    runner.run(["systemctl", "stop", "prometheus-node-exporter"], check=False, timeout=30)
+    runner.run(["systemctl", "disable", "prometheus-node-exporter"], check=False, timeout=30)
+    state = _load_state()
+    tx = InstallTransaction(data=state)
+    created_here = [name for name in state.get("installed_packages", []) if name not in snapshot.get("installed_packages", [])]
+    if "prometheus-node-exporter" in created_here:
+        runner.run(["apt-get", "remove", "-y", "--purge", "prometheus-node-exporter"], check=False, timeout=900)
+    tx.restore_backups()
+    if not state.get("metrics_config_preexisting"):
+        NODE_EXPORTER_CONFIG.unlink(missing_ok=True)
+    try:
+        repair(metrics_ips_override=[])
+    finally:
+        state = _load_state()
+        for key in ("installed_packages", "created_paths", "backups"):
+            state[key] = snapshot.get(key, [])
+        state.pop("metrics_config_preexisting", None)
+        state["metrics_ips"] = []
+        StateStore().save(state)
+
+
+def _enable_metrics(ips_raw) -> int:
+    """Install the exporter on an already installed node. Firewall first, so :9100 is never exposed."""
+    import copy
+
+    from .constants import BACKUP_DIR, METRICS_PORT
+    from .install import install_metrics_exporter_package
+    from .metrics import configure_node_exporter
+    from .state import InstallTransaction
+
+    _root_check()
+    state = _load_state()
+    runner = _runner()
+    if state.get("metrics_ips"):
+        raise InstallerError("метрики уже включены; чтобы сменить IP, используйте: remnawave-node metrics --ip IP", stage="metrics")
+    if state.get("status") != "installed":
+        raise InstallerError("нода должна быть в статусе installed; сначала выполните repair", stage="metrics")
+    if int(state.get("node_port", NODE_PORT)) == METRICS_PORT:
+        raise InstallerError(f"порт {METRICS_PORT} зарезервирован для экспортёра метрик", stage="metrics")
+    if ips_raw:
+        try:
+            ips = parse_ips(ips_raw)
+        except ValueError as exc:
+            raise InstallerError(str(exc), stage="metrics") from exc
+    else:
+        ips = _prompt_prometheus_ips()
+    if not ips:
+        raise InstallerError("укажите хотя бы один IP сервера Prometheus", stage="metrics")
+    snapshot = copy.deepcopy(state)
+    step(f"Файрвол: :{METRICS_PORT} только для {', '.join(ips)}", "running")
+    repair(metrics_ips_override=ips)
+    state = _load_state()
+    tx = InstallTransaction(data=state)
+    tx.backup_root = BACKUP_DIR / time.strftime("%Y%m%d-%H%M%S")
+    tx.backup_root.mkdir(parents=True, exist_ok=True)
+    try:
+        step("System metrics exporter", "running")
+        install_metrics_exporter_package(runner, tx)
+        configure_node_exporter(runner)
+        step("System metrics exporter", "ok")
+    except Exception as exc:
+        try:
+            _undo_enable_metrics(runner, snapshot)
+        except Exception as undo_exc:
+            raise InstallerError(f"не удалось включить метрики ({exc}), и откат завершился с ошибкой: {undo_exc}", stage="metrics") from exc
+        raise InstallerError(f"не удалось включить метрики, изменения отменены: {exc}", stage="metrics") from exc
+    state["metrics_ips"] = ips
+    StateStore().save(state)
+    _print_metrics_info(state, runner)
+    return 0
+
+
+def metrics_command(ips_raw=None, enable=False) -> int:
+    """Show the Prometheus connection block, enable metrics on an installed node, or change the collector IP(s)."""
+    if enable:
+        return _enable_metrics(ips_raw)
     state = _load_state()
     runner = _runner()
     current = list(state.get("metrics_ips", []))
     if not current:
-        raise InstallerError("метрики не были включены при установке; включите их при повторной установке (METRICS_SERVER_IPS)", stage="metrics")
+        raise InstallerError("метрики не включены на этой ноде; включите без переустановки: remnawave-node metrics --enable --ip IP_PROMETHEUS", stage="metrics")
     if ips_raw is None:
         _print_metrics_info(state, runner)
         return 0
@@ -662,7 +755,7 @@ def main(argv=None) -> int:
         if command == "repair":
             return repair()
         if command == "metrics":
-            return metrics_command(args.ip)
+            return metrics_command(args.ip, args.enable)
         if command == "uninstall":
             return uninstall(args.yes)
         if command == "update":
