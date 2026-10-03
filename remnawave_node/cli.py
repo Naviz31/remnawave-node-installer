@@ -14,12 +14,12 @@ from .constants import APP_NAME, DEFAULT_TLS_MODE, DEFAULT_WS_PROXY_PORT, INSTAL
 from .errors import InstallerError
 from .firewall import apply_plan, build_iptables_plan, build_nft_plan, build_ufw_plan, detect_backend, firewall_is_applied, find_nft_input_chain, iptables_ipv6_available, remove_managed_firewall
 from .health import check_health, require_install_health
-from .install import install, panel_ips_from_environment, restore_service_states, tls_mode_from_environment
+from .install import install, metrics_ips_from_environment, panel_ips_from_environment, restore_service_states, tls_mode_from_environment
 from .logging_utils import configure_logger
 from .nginx import write_nginx_config
 from .security import env_line, read_env_file, write_private
 from .state import StateStore
-from .system import CommandRunner, read_os_release
+from .system import CommandRunner, is_service_active, read_os_release
 from .ssh_guard import detect_ssh_port
 from .ui import error_box, kv, step, title
 from .validators import normalize_domain, parse_ips
@@ -75,6 +75,27 @@ def _read_panel_ips() -> List[str]:
         if panel_ips:
             return panel_ips
         print(f"IP панели не может быть пустым. Повторите ввод {INPUT_EXIT_HINT}.", file=sys.stderr)
+
+
+def _read_metrics_ips() -> List[str]:
+    configured = metrics_ips_from_environment()
+    if configured is not None:
+        return configured
+    enabled = _read_interactive(f"Установить экспортёр системных метрик для Prometheus? [y/N] {INPUT_EXIT_HINT}: ").lower()
+    if enabled not in {"y", "yes", "д", "да"}:
+        return []
+    print("Prometheus сам забирает метрики с ноды (порт 9100). Порт будет открыт только для указанного IP.")
+    print("Это IP сервера, где работает Prometheus (не IP панели Remnawave). Можно несколько через запятую.")
+    while True:
+        raw = _read_interactive(f"IP сервера Prometheus (откуда будут забираться метрики) {INPUT_EXIT_HINT}: ")
+        try:
+            ips = parse_ips(raw)
+        except ValueError as exc:
+            print(f"Ошибка: {exc}. Повторите ввод {INPUT_EXIT_HINT}.", file=sys.stderr)
+            continue
+        if ips:
+            return ips
+        print(f"IP не может быть пустым при включённом сборе метрик. Повторите ввод {INPUT_EXIT_HINT}.", file=sys.stderr)
 
 
 def _read_required(prompt: str) -> str:
@@ -214,6 +235,16 @@ def show_status() -> int:
     kv("Nginx", health.get("nginx", "unknown"), "ok" if health.get("nginx") == "valid" else "error")
     kv("Cover", health.get("cover_backend", "unknown"), "ok" if health.get("cover_backend") == "listening" else "warn")
     kv("Node API", health.get("node_port", "unknown"), "ok" if health.get("node_port") == "listening" else "warn")
+    if state.get("metrics_ips"):
+        active = is_service_active(runner, "prometheus-node-exporter")
+        kv("System metrics exporter", "running" if active else "stopped", "ok" if active else "warn")
+        from .metrics import print_prometheus_report
+        from .system import public_ip
+        try:
+            node_ip = public_ip(runner, 4)
+        except Exception:
+            node_ip = None
+        print_prometheus_report(node_ip, state.get("metrics_ips", []), active)
     if tls_options["tls_mode"] == TLS_MODE_NGINX_WS:
         kv("TLS ingress", health.get("tls_ingress", "unknown"), "ok" if health.get("tls_ingress") == "listening" else "error")
         kv("HTTPS cover", health.get("public_https", "unknown"), "ok" if health.get("public_https") == "ok" else "error")
@@ -255,8 +286,11 @@ def doctor() -> int:
             runner,
             int(state.get("node_port", NODE_PORT)),
             state.get("panel_ips", []),
+            state.get("metrics_ips", []),
         ),
     }
+    if state.get("metrics_ips"):
+        checks["system metrics exporter"] = is_service_active(runner, "prometheus-node-exporter")
     critical_checks = set()
     if tls_mode == TLS_MODE_NGINX_WS:
         ws_expected = bool(state.get("ws_backend_was_active"))
@@ -289,22 +323,22 @@ def _nft_input_chain_from_state(identifiers):
     return None
 
 
-def _build_firewall_plan(runner, backend, panel_ips, ssh_port, node_port, identifiers=None):
+def _build_firewall_plan(runner, backend, panel_ips, ssh_port, node_port, identifiers=None, metrics_ips=None):
     if backend == "ufw":
-        return build_ufw_plan(panel_ips, ssh_port, node_port)
+        return build_ufw_plan(panel_ips, ssh_port, node_port, metrics_ips)
     if backend == "nftables":
         owns_table = any(":remnawave_node:" in identifier for identifier in (identifiers or []))
         if owns_table:
-            return build_nft_plan(panel_ips, ssh_port, node_port)
+            return build_nft_plan(panel_ips, ssh_port, node_port, metrics_ips=metrics_ips)
         input_chain = _nft_input_chain_from_state(identifiers or []) or find_nft_input_chain(runner)
         if not input_chain:
             raise InstallerError("обнаружен nftables без inet input chain; firewall не изменён", stage="firewall")
-        return build_nft_plan(panel_ips, ssh_port, node_port, input_chain)
+        return build_nft_plan(panel_ips, ssh_port, node_port, input_chain, metrics_ips)
     if backend == "iptables":
         if not iptables_ipv6_available(runner):
             raise InstallerError("для iptables необходимы iptables и ip6tables: IPv6 Node API нельзя безопасно закрыть", stage="firewall")
-        return build_iptables_plan(panel_ips, ssh_port, node_port)
-    return build_nft_plan(panel_ips, ssh_port, node_port)
+        return build_iptables_plan(panel_ips, ssh_port, node_port, metrics_ips)
+    return build_nft_plan(panel_ips, ssh_port, node_port, metrics_ips=metrics_ips)
 
 
 def _remember_firewall_item(items, item):
@@ -321,8 +355,9 @@ def _recover_interrupted_repair(state, runner, node_port):
     old_identifiers = list(snapshot.get("created_firewall", []))
     old_backend = snapshot.get("firewall_backend") or state.get("firewall_backend") or detect_backend(runner)
     old_panel_ips = snapshot.get("panel_ips", state.get("panel_ips", []))
+    old_metrics_ips = snapshot.get("metrics_ips", state.get("metrics_ips", []))
     ssh_port = detect_ssh_port(runner)
-    old_plan = _build_firewall_plan(runner, old_backend, old_panel_ips, ssh_port, node_port, old_identifiers) if old_identifiers else None
+    old_plan = _build_firewall_plan(runner, old_backend, old_panel_ips, ssh_port, node_port, old_identifiers, old_metrics_ips) if old_identifiers else None
     try:
         remove_managed_firewall(state.get("created_firewall", []), runner, node_port)
         if old_plan is not None:
@@ -330,6 +365,7 @@ def _recover_interrupted_repair(state, runner, node_port):
         state["created_firewall"] = old_identifiers
         state["firewall_backend"] = old_backend
         state["panel_ips"] = old_panel_ips
+        state["metrics_ips"] = old_metrics_ips
         state.pop("repair_previous_firewall", None)
         state["status"] = "installed"
         StateStore().save(state)
@@ -360,6 +396,7 @@ def repair() -> int:
     generate_site(SITE_ROOT, domain)
     write_nginx_config(domain, certificate=True, runner=runner, **tls_options)
     panel_ips = panel_ips_from_environment() or state.get("panel_ips", [])
+    metrics_ips = state.get("metrics_ips", [])
     if not panel_ips:
         raise InstallerError("PANEL_IPS обязателен для repair: задайте IP панели в /etc/remnawave-node/config.env")
     backend = detect_backend(runner)
@@ -367,13 +404,14 @@ def repair() -> int:
     old_identifiers = list(state.get("created_firewall", []))
     old_backend = state.get("firewall_backend") or backend
     old_panel_ips = state.get("panel_ips", panel_ips)
-    plan = _build_firewall_plan(runner, backend, panel_ips, ssh_port, node_port)
-    old_plan = _build_firewall_plan(runner, old_backend, old_panel_ips, ssh_port, node_port, old_identifiers) if old_identifiers else None
+    plan = _build_firewall_plan(runner, backend, panel_ips, ssh_port, node_port, metrics_ips=metrics_ips)
+    old_plan = _build_firewall_plan(runner, old_backend, old_panel_ips, ssh_port, node_port, old_identifiers, state.get("metrics_ips", [])) if old_identifiers else None
     state["status"] = "repairing"
     state["repair_previous_firewall"] = {
         "created_firewall": old_identifiers,
         "firewall_backend": old_backend,
         "panel_ips": old_panel_ips,
+        "metrics_ips": state.get("metrics_ips", []),
     }
     state["created_firewall"] = []
     StateStore().save(state)
@@ -391,6 +429,7 @@ def repair() -> int:
         state["created_firewall"] = new_created
         state["firewall_backend"] = plan.backend
         state["panel_ips"] = panel_ips
+        state["metrics_ips"] = metrics_ips
         StateStore().save(state)
         health = check_health(runner, NODE_DIR, node_port, state.get("domain"), **tls_options)
         if tls_options["tls_mode"] == DEFAULT_TLS_MODE and health.get("xray") == "listening" and health.get("self_steal") == "ok":
@@ -517,6 +556,8 @@ def uninstall(confirmed: bool) -> int:
     runner = _runner()
     if (NODE_DIR / "docker-compose.yml").exists():
         compose(runner, NODE_DIR, "down", check=False)
+    if state.get("metrics_ips"):
+        runner.run(["systemctl", "stop", "prometheus-node-exporter"], check=False, timeout=30)
     remove_managed_firewall(state.get("created_firewall", []), runner, int(state.get("node_port", NODE_PORT)))
     for item in reversed(state.get("backups", [])):
         source, backup = Path(item["source"]), Path(item["backup"])
@@ -559,6 +600,7 @@ def main(argv=None) -> int:
                 if existing_result >= 0:
                     return existing_result
             panel_ips = _read_panel_ips()
+            metrics_ips = _read_metrics_ips()
             domain = _read_domain()
             tls_mode = getattr(args, "tls_mode", None) or tls_mode_from_environment() or _read_tls_mode()
             ws_proxy_port = getattr(args, "ws_proxy_port", None)
@@ -570,6 +612,7 @@ def main(argv=None) -> int:
                 skip_dns=getattr(args, "skip_dns_check", False),
                 tls_mode=tls_mode,
                 ws_proxy_port=ws_proxy_port,
+                metrics_ips=metrics_ips,
             )
         if command == "status":
             return show_status()

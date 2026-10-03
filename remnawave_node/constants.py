@@ -6,6 +6,7 @@ APP_SLUG = "remnawave-node"
 NODE_CONTAINER = "remnanode"
 NODE_IMAGE = "remnawave/node:3.4.1"
 NODE_PORT = 2222
+METRICS_PORT = 9100
 DEFAULT_TLS_MODE = "xray"
 TLS_MODE_NGINX_WS = "nginx-ws"
 DEFAULT_WS_PROXY_PORT = 10000
@@ -25,6 +26,7 @@ FAIL2BAN_CONFIG = Path("/etc/fail2ban/jail.d") / f"{NGINX_SITE_NAME}.conf"
 LOGROTATE_CONFIG = Path("/etc/logrotate.d") / NGINX_SITE_NAME
 CERTBOT_LIVE_DIR = Path("/etc/letsencrypt/live")
 DEFAULT_PANEL_IP_ENV = Path("/etc/remnawave-node/config.env")
+NODE_EXPORTER_CONFIG = Path("/etc/default/prometheus-node-exporter")
 RENEWAL_HOOK = Path("/etc/letsencrypt/renewal-hooks/deploy/remnawave-node-reload")
 
 SUPPORTED_DISTROS = {"ubuntu", "debian"}

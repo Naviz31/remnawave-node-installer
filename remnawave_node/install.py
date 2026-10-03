@@ -13,7 +13,9 @@ from .constants import (
     INSTALLER_DIR,
     INSTALLER_LOG,
     LOGROTATE_CONFIG,
+    METRICS_PORT,
     NODE_DIR,
+    NODE_EXPORTER_CONFIG,
     NODE_IMAGE,
     NODE_LOG_DIR,
     NODE_PORT,
@@ -46,6 +48,23 @@ def panel_ips_from_environment() -> List[str]:
             except ValueError as exc:
                 raise InstallerError(str(exc), stage="preflight") from exc
     return []
+
+
+def metrics_ips_from_environment() -> Optional[List[str]]:
+    config = dict(read_env_file(Path("/etc/remnawave-node/config.env")))
+    enabled = os.environ.get("METRICS_ENABLED", config.get("METRICS_ENABLED", "")).strip().lower()
+    if enabled in {"0", "false", "no", "off"}:
+        return []
+    candidates = [os.environ.get("METRICS_SERVER_IPS", ""), config.get("METRICS_SERVER_IPS", "")]
+    for candidate in candidates:
+        if candidate.strip():
+            try:
+                return parse_ips(candidate)
+            except ValueError as exc:
+                raise InstallerError(str(exc), stage="preflight") from exc
+    if enabled in {"1", "true", "yes", "on"}:
+        return None
+    return None
 
 
 def node_port_from_environment() -> int:
@@ -91,6 +110,24 @@ def install_packages(runner: CommandRunner, tx: InstallTransaction) -> None:
         runner.run(["apt-get", "update"], timeout=600)
         runner.run(["apt-get", "install", "-y", *missing], timeout=900)
         tx.state.save(tx.data)
+
+
+def install_metrics_exporter_package(runner: CommandRunner, tx: InstallTransaction) -> None:
+    package = "prometheus-node-exporter"
+    config_preexisting = NODE_EXPORTER_CONFIG.exists()
+    tx.data["metrics_config_preexisting"] = config_preexisting
+    tx.state.save(tx.data)
+    if config_preexisting:
+        tx.backup_file(NODE_EXPORTER_CONFIG)
+    else:
+        tx.record_path(NODE_EXPORTER_CONFIG)
+    if package_installed(package):
+        return
+    tx.data.setdefault("installed_packages", []).append(package)
+    tx.state.save(tx.data)
+    runner.run(["apt-get", "update"], timeout=600)
+    runner.run(["apt-get", "install", "-y", package], timeout=900)
+    tx.state.save(tx.data)
 
 
 def ensure_docker(runner: CommandRunner, tx: InstallTransaction) -> None:
@@ -168,6 +205,8 @@ def rollback(tx: InstallTransaction, runner: CommandRunner) -> None:
     try:
         if tx.data.get("node_started"):
             compose(runner, NODE_DIR, "down", check=False)
+        if tx.data.get("metrics_ips"):
+            runner.run(["systemctl", "stop", "prometheus-node-exporter"], check=False, timeout=30)
         if tx.data.get("created_firewall"):
             from .firewall import remove_managed_firewall
             remove_managed_firewall(tx.data["created_firewall"], runner, int(tx.data.get("node_port", NODE_PORT)))
@@ -207,12 +246,19 @@ def install(
     skip_dns: bool = False,
     tls_mode: str = DEFAULT_TLS_MODE,
     ws_proxy_port: Optional[int] = None,
+    metrics_ips: Optional[List[str]] = None,
 ) -> int:
     logger = configure_logger(INSTALLER_LOG, [secret])
     runner = CommandRunner(logger, [secret])
     panel_ips = panel_ips or panel_ips_from_environment()
     if not panel_ips:
         raise InstallerError("PANEL_IPS обязателен: укажите IP панели в /etc/remnawave-node/config.env или переменной окружения", stage="preflight")
+    metrics_ips = metrics_ips or []
+    if metrics_ips:
+        try:
+            metrics_ips = parse_ips(",".join(metrics_ips))
+        except ValueError as exc:
+            raise InstallerError(str(exc), stage="preflight") from exc
     node_port = node_port_from_environment()
     tls_mode = tls_mode.strip().lower()
     if tls_mode not in {DEFAULT_TLS_MODE, TLS_MODE_NGINX_WS}:
@@ -223,6 +269,8 @@ def install(
             raise InstallerError("WS_PROXY_PORT должен быть портом 1-65535, кроме 80, 443, 61001 и NODE_PORT", stage="preflight")
     else:
         ws_proxy_port = DEFAULT_WS_PROXY_PORT
+    if metrics_ips and (node_port == METRICS_PORT or (tls_mode == TLS_MODE_NGINX_WS and ws_proxy_port == METRICS_PORT)):
+        raise InstallerError(f"порт {METRICS_PORT} зарезервирован для экспортёра метрик", stage="preflight")
     tx = InstallTransaction()
     try:
         title(APP_NAME)
@@ -240,12 +288,13 @@ def install(
             for warning in report.warnings:
                 step(warning, "warn")
         tx.begin(domain=report.domain, node_port=node_port, image=NODE_IMAGE, panel_ips=panel_ips)
+        tx.data["metrics_ips"] = metrics_ips
         tx.data["tls_mode"] = tls_mode
         tx.data["ws_proxy_port"] = ws_proxy_port
         tx.state.save(tx.data)
         tx.data["services_before"] = {
             name: {"active": is_service_active(runner, name), "enabled": runner.run(["systemctl", "is-enabled", "--quiet", name], check=False, timeout=10).returncode == 0}
-            for name in ("docker", "nginx", "fail2ban")
+            for name in ("docker", "nginx", "fail2ban", "prometheus-node-exporter")
         }
         tx.state.save(tx.data)
         install_persistent_cli(tx)
@@ -286,18 +335,18 @@ def install(
         backend = detect_backend(runner)
         ssh_port = detect_ssh_port(runner)
         if backend == "ufw":
-            plan = build_ufw_plan(panel_ips, ssh_port, node_port)
+            plan = build_ufw_plan(panel_ips, ssh_port, node_port, metrics_ips)
         elif backend == "nftables":
             input_chain = find_nft_input_chain(runner)
             if not input_chain:
                 raise InstallerError("обнаружен nftables без inet input chain; firewall не изменён, настройте правило Node API вручную", stage="firewall")
-            plan = build_nft_plan(panel_ips, ssh_port, node_port, input_chain)
+            plan = build_nft_plan(panel_ips, ssh_port, node_port, input_chain, metrics_ips)
         elif backend == "iptables":
             if not iptables_ipv6_available(runner):
                 raise InstallerError("для iptables необходимы iptables и ip6tables: IPv6 Node API нельзя безопасно закрыть", stage="firewall")
-            plan = build_iptables_plan(panel_ips, ssh_port, node_port)
+            plan = build_iptables_plan(panel_ips, ssh_port, node_port, metrics_ips)
         else:
-            plan = build_nft_plan(panel_ips, ssh_port, node_port)
+            plan = build_nft_plan(panel_ips, ssh_port, node_port, metrics_ips=metrics_ips)
             plan.warnings.append("активный firewall не найден; создана отдельная nftables-таблица")
         apply_plan(plan, runner, on_created=tx.record_firewall)
         tx.data["firewall_backend"] = plan.backend
@@ -305,6 +354,13 @@ def install(
         for warning in plan.warnings:
             step(warning, "warn")
         step("Firewall", "ok")
+
+        if metrics_ips:
+            step("System metrics exporter", "running")
+            install_metrics_exporter_package(runner, tx)
+            from .metrics import configure_node_exporter
+            configure_node_exporter(runner)
+            step("System metrics exporter", "ok")
 
         maybe_fail("ssh")
         step("SSH protection", "running")
@@ -367,6 +423,8 @@ def install(
         kv("Домен", report.domain)
         kv("Публичный IPv4", report.public_ipv4 or "не определён", "warn" if not report.public_ipv4 else "ok")
         kv("Node API", f":{node_port} / только IP панели")
+        if metrics_ips:
+            kv("Метрики", f":{METRICS_PORT} / только {', '.join(metrics_ips)}")
         kv("Cover backend", "/dev/shm/nginx.sock")
         kv("TLS", "валидирован")
         if tls_mode == TLS_MODE_NGINX_WS:
@@ -376,6 +434,9 @@ def install(
             step(f"VLESS/WS inbound ждёт Config Profile на 127.0.0.1:{ws_proxy_port}", "warn")
         elif tls_mode == DEFAULT_TLS_MODE and health.get("xray") == "waiting-for-panel-config":
             step("Xray ждёт Config Profile из панели — это нормально до настройки узла", "warn")
+        if metrics_ips:
+            from .metrics import print_prometheus_report
+            print_prometheus_report(report.public_ipv4, metrics_ips, is_service_active(runner, "prometheus-node-exporter"))
         print("\nКоманды: remnawave-node status · doctor · repair · logs")
         return 0
     except KeyboardInterrupt:

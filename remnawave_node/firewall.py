@@ -4,7 +4,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Tuple
 
-from .constants import NODE_PORT
+from .constants import METRICS_PORT, NODE_PORT
+from .errors import InstallerError
 from .system import CommandRunner
 
 
@@ -39,8 +40,9 @@ def _validate_panel_ips(panel_ips: List[str]) -> List[str]:
     return values
 
 
-def build_ufw_plan(panel_ips: List[str], ssh_port: int, node_port: int = NODE_PORT) -> FirewallPlan:
+def build_ufw_plan(panel_ips: List[str], ssh_port: int, node_port: int = NODE_PORT, metrics_ips: Optional[List[str]] = None) -> FirewallPlan:
     ips = _validate_panel_ips(panel_ips)
+    metrics_ips = _validate_panel_ips(metrics_ips or [])
     plan = FirewallPlan("ufw")
     plan.commands.extend([
         ["ufw", "allow", "80/tcp", "comment", "remnawave-node http"],
@@ -49,6 +51,11 @@ def build_ufw_plan(panel_ips: List[str], ssh_port: int, node_port: int = NODE_PO
     for ip in ips:
         plan.commands.append(["ufw", "allow", "from", ip, "to", "any", "port", str(node_port), "proto", "tcp", "comment", "remnawave-node panel"])
         plan.identifiers.append(f"ufw:{ip}:{node_port}")
+    if metrics_ips:
+        plan.commands.append(["ufw", "deny", f"{METRICS_PORT}/tcp", "comment", "system metrics exporter"])
+    for ip in metrics_ips:
+        plan.commands.append(["ufw", "insert", "1", "allow", "from", ip, "to", "any", "port", str(METRICS_PORT), "proto", "tcp", "comment", "system metrics collector"])
+        plan.identifiers.append(f"ufw:{ip}:{METRICS_PORT}")
     if not ips:
         plan.warnings.append("PANEL_IPS не задан: NODE_PORT останется закрыт, пока вы не добавите IP панели")
     plan.identifiers.extend(["ufw:base:80", "ufw:base:443"])
@@ -70,8 +77,9 @@ def find_nft_input_chain(runner: CommandRunner) -> Optional[Tuple[str, str, str]
     return None
 
 
-def build_nft_plan(panel_ips: List[str], ssh_port: int, node_port: int = NODE_PORT, input_chain=None) -> FirewallPlan:
+def build_nft_plan(panel_ips: List[str], ssh_port: int, node_port: int = NODE_PORT, input_chain=None, metrics_ips: Optional[List[str]] = None) -> FirewallPlan:
     ips = _validate_panel_ips(panel_ips)
+    metrics_ips = _validate_panel_ips(metrics_ips or [])
     plan = FirewallPlan("nftables")
     chain = "remnawave_node_api"
     if input_chain:
@@ -87,39 +95,49 @@ def build_nft_plan(panel_ips: List[str], ssh_port: int, node_port: int = NODE_PO
     for ip in ips:
         address_family = "ip6" if ":" in ip else "ip"
         commands.append(["nft", "add", "rule", family, table, chain, address_family, "saddr", ip, "tcp", "dport", str(node_port), "accept"])
-    commands.extend([
-        ["nft", "add", "rule", family, table, chain, "tcp", "dport", str(node_port), "drop"],
-        ["nft", "add", "rule", family, table, chain, "return"],
-        ["nft", "insert", "rule", family, table, parent, "tcp", "dport", str(node_port), "jump", chain],
-    ])
+    for ip in metrics_ips:
+        address_family = "ip6" if ":" in ip else "ip"
+        commands.append(["nft", "add", "rule", family, table, chain, address_family, "saddr", ip, "tcp", "dport", str(METRICS_PORT), "accept"])
+    commands.append(["nft", "add", "rule", family, table, chain, "tcp", "dport", str(node_port), "drop"])
+    if metrics_ips:
+        commands.append(["nft", "add", "rule", family, table, chain, "tcp", "dport", str(METRICS_PORT), "drop"])
+    commands.append(["nft", "add", "rule", family, table, chain, "return"])
+    commands.append(["nft", "insert", "rule", family, table, parent, "tcp", "dport", str(node_port), "jump", chain])
+    if metrics_ips:
+        commands.append(["nft", "insert", "rule", family, table, parent, "tcp", "dport", str(METRICS_PORT), "jump", chain])
     plan.commands = commands
-    plan.identifiers = [f"nft:{family}:{table}:{parent}:{chain}:{node_port}"]
+    ports = f"{node_port},{METRICS_PORT}" if metrics_ips else str(node_port)
+    plan.identifiers = [f"nft:{family}:{table}:{parent}:{chain}:{ports}"]
     if not ips:
         plan.warnings.append("PANEL_IPS не задан: NODE_PORT останется закрыт, пока вы не добавите IP панели")
     return plan
 
 
-def build_iptables_plan(panel_ips: List[str], ssh_port: int, node_port: int = NODE_PORT) -> FirewallPlan:
+def build_iptables_plan(panel_ips: List[str], ssh_port: int, node_port: int = NODE_PORT, metrics_ips: Optional[List[str]] = None) -> FirewallPlan:
     """Create narrowly scoped IPv4 and IPv6 INPUT jumps for Node API only."""
     ips = _validate_panel_ips(panel_ips)
+    metrics_ips = _validate_panel_ips(metrics_ips or [])
     plan = FirewallPlan("iptables")
     plan.commands = []
     plan.identifiers = []
-    for tool, chain, family_ips, identifier_prefix in (
-        ("iptables", "REMNAWAVE_NODE", [ip for ip in ips if ":" not in ip], "iptables"),
-        ("ip6tables", "REMNAWAVE_NODE6", [ip for ip in ips if ":" in ip], "ip6tables"),
+    for tool, chain, family_ips, family_metrics_ips, identifier_prefix in (
+        ("iptables", "REMNAWAVE_NODE", [ip for ip in ips if ":" not in ip], [ip for ip in metrics_ips if ":" not in ip], "iptables"),
+        ("ip6tables", "REMNAWAVE_NODE6", [ip for ip in ips if ":" in ip], [ip for ip in metrics_ips if ":" in ip], "ip6tables"),
     ):
-        plan.commands.extend([
-            [tool, "-N", chain],
-            [tool, "-I", "INPUT", "1", "-p", "tcp", "--dport", str(node_port), "-j", chain],
-        ])
+        plan.commands.append([tool, "-N", chain])
+        plan.commands.append([tool, "-I", "INPUT", "1", "-p", "tcp", "--dport", str(node_port), "-j", chain])
+        if metrics_ips:
+            plan.commands.append([tool, "-I", "INPUT", "1", "-p", "tcp", "--dport", str(METRICS_PORT), "-j", chain])
         for ip in family_ips:
             plan.commands.append([tool, "-A", chain, "-p", "tcp", "-s", ip, "--dport", str(node_port), "-j", "ACCEPT"])
-        plan.commands.extend([
-            [tool, "-A", chain, "-p", "tcp", "--dport", str(node_port), "-j", "DROP"],
-            [tool, "-A", chain, "-j", "RETURN"],
-        ])
-        plan.identifiers.append(f"{identifier_prefix}:{chain}:{node_port}")
+        for ip in family_metrics_ips:
+            plan.commands.append([tool, "-A", chain, "-p", "tcp", "-s", ip, "--dport", str(METRICS_PORT), "-j", "ACCEPT"])
+        plan.commands.append([tool, "-A", chain, "-p", "tcp", "--dport", str(node_port), "-j", "DROP"])
+        if metrics_ips:
+            plan.commands.append([tool, "-A", chain, "-p", "tcp", "--dport", str(METRICS_PORT), "-j", "DROP"])
+        plan.commands.append([tool, "-A", chain, "-j", "RETURN"])
+        ports = f"{node_port},{METRICS_PORT}" if metrics_ips else str(node_port)
+        plan.identifiers.append(f"{identifier_prefix}:{chain}:{ports}")
     if not ips:
         plan.warnings.append("PANEL_IPS не задан: NODE_PORT останется закрыт, пока вы не добавите IP панели")
     return plan
@@ -136,16 +154,33 @@ def apply_plan(plan: FirewallPlan, runner: CommandRunner, on_created: Optional[C
     if plan.backend == "ufw":
         current = runner.run(["ufw", "status"], check=False, timeout=15).stdout
         created = []
+        if any(command[1] == "deny" and command[2] == f"{METRICS_PORT}/tcp" for command in plan.commands) and _ufw_rule_present(current, str(METRICS_PORT), ""):
+            raise InstallerError(f"UFW уже разрешает {METRICS_PORT}/tcp из любой сети; удалите широкое правило перед включением метрик", stage="firewall")
         for command in plan.commands:
-            if "from" in command and "port" in command:
+            if command[1] == "insert":
                 port = command[command.index("port") + 1]
+                source = command[command.index("from") + 1]
+                runner.run(command, timeout=30)
+                identifier = f"ufw:{source}:{port}"
+                created.append(identifier)
+                if on_created:
+                    on_created(identifier)
+                continue
+            if command[1] == "deny":
+                port = command[2].split("/", 1)[0]
+                source = ""
+                already_present = _ufw_deny_present(current, port)
+            elif "from" in command and "port" in command:
+                port = command[command.index("port") + 1]
+                source = command[command.index("from") + 1]
+                already_present = _ufw_rule_present(current, port, source)
             else:
                 port = next((token.split("/", 1)[0] for token in command if "/tcp" in token), "")
-            source = command[command.index("from") + 1] if "from" in command else ""
-            already_present = _ufw_rule_present(current, port, source)
+                source = ""
+                already_present = _ufw_rule_present(current, port, source)
             if not already_present:
                 runner.run(command, timeout=30)
-                identifier = f"ufw:{source}:{port}" if source else f"ufw:base:{port}"
+                identifier = f"ufw:deny:{port}" if command[1] == "deny" else f"ufw:{source}:{port}" if source else f"ufw:base:{port}"
                 created.append(identifier)
                 if on_created:
                     on_created(identifier)
@@ -178,7 +213,16 @@ def _ufw_rule_present(current: str, port: str, source: str) -> bool:
     return False
 
 
-def firewall_is_applied(identifiers: List[str], runner: CommandRunner, node_port: int = NODE_PORT, panel_ips: Optional[List[str]] = None) -> bool:
+def _ufw_deny_present(current: str, port: str) -> bool:
+    expected = f"{port}/tcp"
+    return any(
+        "DENY" in " ".join(raw_line.split()) and "Anywhere" in " ".join(raw_line.split())
+        and " ".join(raw_line.split()).startswith(expected + " ")
+        for raw_line in current.splitlines()
+    )
+
+
+def firewall_is_applied(identifiers: List[str], runner: CommandRunner, node_port: int = NODE_PORT, panel_ips: Optional[List[str]] = None, metrics_ips: Optional[List[str]] = None) -> bool:
     """Verify managed firewall resources still exist without changing firewall state."""
     if not identifiers:
         return False
@@ -189,6 +233,11 @@ def firewall_is_applied(identifiers: List[str], runner: CommandRunner, node_port
         if identifier.startswith("ufw:"):
             if ufw_status is None:
                 ufw_status = runner.run(["ufw", "status"], check=False, timeout=15).stdout
+            if identifier.startswith("ufw:deny:"):
+                port = identifier.rsplit(":", 1)[1]
+                if not _ufw_deny_present(ufw_status, port):
+                    return False
+                continue
             if identifier.startswith("ufw:base:"):
                 port = identifier.rsplit(":", 1)[1]
                 source = ""
@@ -199,50 +248,49 @@ def firewall_is_applied(identifiers: List[str], runner: CommandRunner, node_port
         elif identifier.startswith(("iptables:", "ip6tables:")):
             parts = identifier.split(":")
             if len(parts) == 2:
-                tool, chain, port = parts[0], parts[1], str(node_port)
+                tool, chain, ports = parts[0], parts[1], [str(node_port)]
             else:
-                tool, chain, port = parts
+                tool, chain, raw_ports = parts
+                ports = raw_ports.split(",")
             chain_rules = iptables_cache.setdefault((tool, chain), runner.run([tool, "-S", chain], check=False, timeout=15))
             input_rules = iptables_cache.setdefault((tool, "INPUT"), runner.run([tool, "-S", "INPUT"], check=False, timeout=15))
             chain_lines = [line.split() for line in chain_rules.stdout.splitlines()]
-            jump_present = any(
-                (fields[:2] == ["-A", "INPUT"] and "-p" in fields and fields[fields.index("-p") + 1] == "tcp"
-                 and "--dport" in fields and fields[fields.index("--dport") + 1] == port
-                 and "-j" in fields and fields[fields.index("-j") + 1] == chain)
-                for fields in (line.split() for line in input_rules.stdout.splitlines())
-            )
-            drop_present = any(
-                fields[:2] == ["-A", chain] and "--dport" in fields and fields[fields.index("--dport") + 1] == port
-                and "-j" in fields and fields[fields.index("-j") + 1] == "DROP"
-                for fields in chain_lines
-            )
-            if panel_ips:
-                expected_tool = tool
-                expected_chain = chain
-                expected_ips = [ip for ip in panel_ips if (":" in ip) == (expected_tool == "ip6tables")]
+            input_lines = [line.split() for line in input_rules.stdout.splitlines()]
+            for port in ports:
+                jump_present = any(
+                    fields[:2] == ["-A", "INPUT"] and "-p" in fields and fields[fields.index("-p") + 1] == "tcp"
+                    and "--dport" in fields and fields[fields.index("--dport") + 1] == port
+                    and "-j" in fields and fields[fields.index("-j") + 1] == chain
+                    for fields in input_lines
+                )
+                drop_present = any(
+                    fields[:2] == ["-A", chain] and "--dport" in fields and fields[fields.index("--dport") + 1] == port
+                    and "-j" in fields and fields[fields.index("-j") + 1] == "DROP"
+                    for fields in chain_lines
+                )
+                expected_source_ips = (metrics_ips or []) if port == str(METRICS_PORT) else (panel_ips or [])
+                expected_ips = [ip for ip in expected_source_ips if (":" in ip) == (tool == "ip6tables")]
                 allowed = all(
                     any(
-                        fields[:2] == ["-A", expected_chain] and "-s" in fields and fields[fields.index("-s") + 1] == ip
+                        fields[:2] == ["-A", chain] and "-s" in fields and fields[fields.index("-s") + 1] == ip
                         and "--dport" in fields and fields[fields.index("--dport") + 1] == port
                         and "-j" in fields and fields[fields.index("-j") + 1] == "ACCEPT"
                         for fields in chain_lines
                     )
                     for ip in expected_ips
                 )
-            else:
-                allowed = True
-            if chain_rules.returncode != 0 or not jump_present or not drop_present or not allowed:
-                return False
+                if chain_rules.returncode != 0 or not jump_present or not drop_present or not allowed:
+                    return False
         elif identifier.startswith("nft:"):
             if identifier == "nft:remnawave_node":
                 result = runner.run(["nft", "list", "table", "inet", "remnawave_node"], check=False, timeout=15)
                 if result.returncode != 0:
                     return False
                 continue
-            _, family, table, parent, chain, port = identifier.split(":", 5)
+            _, family, table, parent, chain, raw_ports = identifier.split(":", 5)
             chain_result = nft_cache.setdefault((family, table, chain), runner.run(["nft", "list", "chain", family, table, chain], check=False, timeout=15))
             parent_result = nft_cache.setdefault((family, table, parent), runner.run(["nft", "-a", "list", "chain", family, table, parent], check=False, timeout=15))
-            if chain_result.returncode != 0 or not any(f"dport {port}" in line and f"jump {chain}" in line for line in parent_result.stdout.splitlines()):
+            if chain_result.returncode != 0 or not all(any(f"dport {port}" in line and f"jump {chain}" in line for line in parent_result.stdout.splitlines()) for port in raw_ports.split(",")):
                 return False
     return True
 
@@ -270,33 +318,39 @@ def remove_managed_firewall(identifiers: List[str], runner: CommandRunner, node_
             runner.run(["iptables", "-D", "INPUT", "-j", "REMNAWAVE_NODE"], check=False, timeout=30)
             runner.run(["iptables", "-X", "REMNAWAVE_NODE"], check=False, timeout=30)
         elif identifier.startswith("nft:"):
-            _, family, table, parent, chain, rule_port = identifier.split(":", 5)
-            _remove_nft_rule(family, table, parent, chain, rule_port, runner)
+            _, family, table, parent, chain, raw_ports = identifier.split(":", 5)
+            for rule_port in raw_ports.split(","):
+                _remove_nft_rule(family, table, parent, chain, rule_port, runner)
             runner.run(["nft", "delete", "chain", family, table, chain], check=False, timeout=30)
             if table == "remnawave_node":
                 runner.run(["nft", "delete", "table", family, table], check=False, timeout=30)
         elif identifier.startswith("iptables:REMNAWAVE_NODE:"):
             tool = "iptables"
-            _, chain, rule_port = identifier.split(":", 2)
+            _, chain, raw_ports = identifier.split(":", 2)
             rules = runner.run([tool, "-S", chain], check=False, timeout=30)
             for line in reversed(rules.stdout.splitlines()):
                 fields = line.split()
                 if fields and fields[0] == "-A":
                     runner.run([tool, "-D", *fields[1:]], check=False, timeout=30)
-            runner.run([tool, "-D", "INPUT", "-p", "tcp", "--dport", rule_port, "-j", chain], check=False, timeout=30)
+            for rule_port in raw_ports.split(","):
+                runner.run([tool, "-D", "INPUT", "-p", "tcp", "--dport", rule_port, "-j", chain], check=False, timeout=30)
             runner.run([tool, "-X", chain], check=False, timeout=30)
         elif identifier.startswith("ip6tables:REMNAWAVE_NODE6:"):
             tool = "ip6tables"
-            _, chain, rule_port = identifier.split(":", 2)
+            _, chain, raw_ports = identifier.split(":", 2)
             rules = runner.run([tool, "-S", chain], check=False, timeout=30)
             for line in reversed(rules.stdout.splitlines()):
                 fields = line.split()
                 if fields and fields[0] == "-A":
                     runner.run([tool, "-D", *fields[1:]], check=False, timeout=30)
-            runner.run([tool, "-D", "INPUT", "-p", "tcp", "--dport", rule_port, "-j", chain], check=False, timeout=30)
+            for rule_port in raw_ports.split(","):
+                runner.run([tool, "-D", "INPUT", "-p", "tcp", "--dport", rule_port, "-j", chain], check=False, timeout=30)
             runner.run([tool, "-X", chain], check=False, timeout=30)
         elif identifier.startswith("ufw:"):
-            if identifier.startswith("ufw:base:"):
+            if identifier.startswith("ufw:deny:"):
+                port = identifier.rsplit(":", 1)[1]
+                runner.run(["ufw", "delete", "deny", f"{port}/tcp"], check=False, timeout=30)
+            elif identifier.startswith("ufw:base:"):
                 port = identifier.rsplit(":", 1)[1]
                 runner.run(["ufw", "delete", "allow", f"{port}/tcp"], check=False, timeout=30)
             else:
