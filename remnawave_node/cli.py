@@ -142,6 +142,8 @@ def _parser() -> argparse.ArgumentParser:
     sub.add_parser("status", help="показать сводный статус")
     sub.add_parser("doctor", help="запустить расширенную диагностику")
     sub.add_parser("repair", help="восстановить управляемые конфигурации")
+    metrics = sub.add_parser("metrics", help="данные для подключения Prometheus; --ip меняет разрешённый IP сервера метрик")
+    metrics.add_argument("--ip", help="новый IP сервера Prometheus (несколько через запятую)")
     uninstall = sub.add_parser("uninstall", help="удалить только ресурсы, созданные установщиком")
     uninstall.add_argument("--yes", action="store_true", help="не запрашивать подтверждение")
     sub.add_parser("update", help="обновить образ Node с rollback при ошибке")
@@ -221,6 +223,48 @@ def latest_node_image(runner: CommandRunner, current_image: str) -> str:
     return f"{repository}:{max(versions)[1]}"
 
 
+def _print_metrics_info(state, runner, active=None) -> None:
+    from .metrics import print_prometheus_report
+    from .system import public_ip
+
+    if active is None:
+        active = is_service_active(runner, "prometheus-node-exporter")
+    try:
+        node_ip = public_ip(runner, 4)
+    except Exception:
+        node_ip = None
+    print_prometheus_report(node_ip, state.get("metrics_ips", []), active)
+
+
+def metrics_command(ips_raw=None) -> int:
+    """Show the Prometheus connection block, or change the collector IP(s) through a transactional repair."""
+    state = _load_state()
+    runner = _runner()
+    current = list(state.get("metrics_ips", []))
+    if not current:
+        raise InstallerError("метрики не были включены при установке; включите их при повторной установке (METRICS_SERVER_IPS)", stage="metrics")
+    if ips_raw is None:
+        _print_metrics_info(state, runner)
+        return 0
+    _root_check()
+    try:
+        new_ips = parse_ips(ips_raw)
+    except ValueError as exc:
+        raise InstallerError(str(exc), stage="metrics") from exc
+    if not new_ips:
+        raise InstallerError("укажите хотя бы один IP сервера Prometheus", stage="metrics")
+    if sorted(new_ips) == sorted(current):
+        kv("Метрики", "IP не изменился: " + ", ".join(current))
+        _print_metrics_info(state, runner)
+        return 0
+    step(f"Доступ к :9100: {', '.join(current)} → {', '.join(new_ips)}", "running")
+    result = repair(metrics_ips_override=new_ips)
+    state = _load_state()
+    step("Правила файрвола обновлены", "ok")
+    _print_metrics_info(state, runner)
+    return result
+
+
 def show_status() -> int:
     state = _load_state()
     runner = _runner()
@@ -238,13 +282,7 @@ def show_status() -> int:
     if state.get("metrics_ips"):
         active = is_service_active(runner, "prometheus-node-exporter")
         kv("System metrics exporter", "running" if active else "stopped", "ok" if active else "warn")
-        from .metrics import print_prometheus_report
-        from .system import public_ip
-        try:
-            node_ip = public_ip(runner, 4)
-        except Exception:
-            node_ip = None
-        print_prometheus_report(node_ip, state.get("metrics_ips", []), active)
+        _print_metrics_info(state, runner, active)
     if tls_options["tls_mode"] == TLS_MODE_NGINX_WS:
         kv("TLS ingress", health.get("tls_ingress", "unknown"), "ok" if health.get("tls_ingress") == "listening" else "error")
         kv("HTTPS cover", health.get("public_https", "unknown"), "ok" if health.get("public_https") == "ok" else "error")
@@ -378,7 +416,7 @@ def _recover_interrupted_repair(state, runner, node_port):
         raise InstallerError(f"предыдущий repair прерван; старый firewall не удалось восстановить: {exc}", stage="recovery") from exc
 
 
-def repair() -> int:
+def repair(metrics_ips_override=None) -> int:
     _root_check()
     state = _load_state()
     runner = _runner()
@@ -396,7 +434,7 @@ def repair() -> int:
     generate_site(SITE_ROOT, domain)
     write_nginx_config(domain, certificate=True, runner=runner, **tls_options)
     panel_ips = panel_ips_from_environment() or state.get("panel_ips", [])
-    metrics_ips = state.get("metrics_ips", [])
+    metrics_ips = list(metrics_ips_override) if metrics_ips_override is not None else state.get("metrics_ips", [])
     if not panel_ips:
         raise InstallerError("PANEL_IPS обязателен для repair: задайте IP панели в /etc/remnawave-node/config.env")
     backend = detect_backend(runner)
@@ -404,6 +442,7 @@ def repair() -> int:
     old_identifiers = list(state.get("created_firewall", []))
     old_backend = state.get("firewall_backend") or backend
     old_panel_ips = state.get("panel_ips", panel_ips)
+    old_metrics_ips = list(state.get("metrics_ips", []))
     plan = _build_firewall_plan(runner, backend, panel_ips, ssh_port, node_port, metrics_ips=metrics_ips)
     old_plan = _build_firewall_plan(runner, old_backend, old_panel_ips, ssh_port, node_port, old_identifiers, state.get("metrics_ips", [])) if old_identifiers else None
     state["status"] = "repairing"
@@ -457,6 +496,7 @@ def repair() -> int:
             state["created_firewall"] = restored or old_identifiers
             state["firewall_backend"] = old_backend
             state["panel_ips"] = old_panel_ips
+            state["metrics_ips"] = old_metrics_ips
             state.pop("repair_previous_firewall", None)
             state["status"] = "installed"
             StateStore().save(state)
@@ -621,6 +661,8 @@ def main(argv=None) -> int:
             return doctor()
         if command == "repair":
             return repair()
+        if command == "metrics":
+            return metrics_command(args.ip)
         if command == "uninstall":
             return uninstall(args.yes)
         if command == "update":

@@ -111,6 +111,8 @@ Nginx cover website                              Nginx cover website
 | `remnawave-node status` | короткий dashboard состояния |
 | `remnawave-node doctor` | расширенная диагностика и рекомендации |
 | `remnawave-node repair` | восстановление управляемых файлов и контейнера |
+| `remnawave-node metrics` | показать данные для подключения Prometheus (адрес, фрагмент `prometheus.yml`, проверка) |
+| `remnawave-node metrics --ip 198.51.100.5` | сменить IP сервера Prometheus: правила файрвола для `:9100` пересоздаются транзакционно с откатом при сбое |
 | `remnawave-node update` | выбор последнего стабильного semver-тега Docker Hub в текущей major-линейке, pull и rollback при ошибке |
 | `remnawave-node set-secret` | скрытая смена `SECRET_KEY` с возвратом при ошибке |
 | `remnawave-node logs` | последние логи контейнера в режиме follow |
