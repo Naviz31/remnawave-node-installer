@@ -20,7 +20,7 @@ from .nginx import write_nginx_config
 from .security import env_line, read_env_file, write_private
 from .state import StateStore
 from .system import CommandRunner, is_service_active, read_os_release
-from .ssh_guard import detect_ssh_port
+from .ssh_guard import configure_fail2ban, configure_kernel_protection, configure_ssh_limits, detect_ssh_port
 from .ui import error_box, kv, step, title
 from .validators import normalize_domain, parse_ips
 from .website import SITE_ROOT, generate_site
@@ -145,6 +145,7 @@ def _parser() -> argparse.ArgumentParser:
     metrics = sub.add_parser("metrics", help="данные для подключения Prometheus; --ip меняет разрешённый IP сервера метрик")
     metrics.add_argument("--ip", help="IP сервера Prometheus (несколько через запятую)")
     metrics.add_argument("--enable", action="store_true", help="установить экспортёр на уже установленной ноде (вместе с --ip)")
+    sub.add_parser("harden", help="включить защиту SSH и ядра на уже установленной ноде (fail2ban, лимиты sshd, SYN-флуд)")
     uninstall = sub.add_parser("uninstall", help="удалить только ресурсы, созданные установщиком")
     uninstall.add_argument("--yes", action="store_true", help="не запрашивать подтверждение")
     sub.add_parser("update", help="обновить образ Node с rollback при ошибке")
@@ -356,6 +357,22 @@ def metrics_command(ips_raw=None, enable=False) -> int:
     step("Правила файрвола обновлены", "ok")
     _print_metrics_info(state, runner)
     return result
+
+
+def harden() -> int:
+    """Apply the SSH brute-force and SYN-flood protection on a node installed by an older version."""
+    _root_check()
+    runner = _runner()
+    title(APP_NAME)
+    for label, action in (
+        ("Fail2ban (SSH, бан с ростом срока)", lambda: configure_fail2ban(runner)),
+        ("Лимиты sshd", lambda: configure_ssh_limits(runner)),
+        ("Защита от SYN-флуда", lambda: configure_kernel_protection(runner)),
+    ):
+        step(label, "running")
+        step(label, "ok" if action() else "warn")
+    kv("Вход по паролю", "не изменён; ограничений по IP нет")
+    return 0
 
 
 def show_status() -> int:
@@ -756,6 +773,8 @@ def main(argv=None) -> int:
             return repair()
         if command == "metrics":
             return metrics_command(args.ip, args.enable)
+        if command == "harden":
+            return harden()
         if command == "uninstall":
             return uninstall(args.yes)
         if command == "update":

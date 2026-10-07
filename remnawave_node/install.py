@@ -28,7 +28,7 @@ from .logging_utils import configure_logger
 from .nginx import write_nginx_config
 from .preflight import run_preflight
 from .security import read_env_file
-from .ssh_guard import configure_fail2ban, detect_ssh_port
+from .ssh_guard import configure_fail2ban, configure_kernel_protection, configure_ssh_limits, detect_ssh_port
 from .state import InstallTransaction
 from .system import CommandRunner, installed_packages, is_service_active, package_installed
 from .ui import error_box, kv, step, title
@@ -366,6 +366,10 @@ def install(
         step("SSH protection", "running")
         if not configure_fail2ban(runner, tx.backup_file, on_created=tx.record_path):
             step("Fail2ban не найден; существующая SSH-конфигурация не изменена", "warn")
+        if not configure_ssh_limits(runner, tx.backup_file, on_created=tx.record_path):
+            step("Лимиты sshd не применены (sshd не найден или отклонил конфиг)", "warn")
+        if not configure_kernel_protection(runner, on_created=tx.record_path):
+            step("Защита от SYN-флуда не применена (sysctl не найден)", "warn")
         step("SSH protection", "ok")
 
         maybe_fail("nginx")

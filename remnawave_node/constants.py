@@ -23,6 +23,8 @@ NGINX_SITE_NAME = "remnawave-node"
 NGINX_AVAILABLE = Path("/etc/nginx/sites-available") / f"{NGINX_SITE_NAME}.conf"
 NGINX_ENABLED = Path("/etc/nginx/sites-enabled") / f"{NGINX_SITE_NAME}.conf"
 FAIL2BAN_CONFIG = Path("/etc/fail2ban/jail.d") / f"{NGINX_SITE_NAME}.conf"
+SSHD_HARDENING_CONFIG = Path("/etc/ssh/sshd_config.d/90-remnawave-node.conf")
+SYSCTL_CONFIG = Path("/etc/sysctl.d/90-remnawave-node.conf")
 LOGROTATE_CONFIG = Path("/etc/logrotate.d") / NGINX_SITE_NAME
 CERTBOT_LIVE_DIR = Path("/etc/letsencrypt/live")
 DEFAULT_PANEL_IP_ENV = Path("/etc/remnawave-node/config.env")
@@ -40,5 +42,7 @@ MANAGED_PATHS = [
     NGINX_AVAILABLE,
     NGINX_ENABLED,
     FAIL2BAN_CONFIG,
+    SSHD_HARDENING_CONFIG,
+    SYSCTL_CONFIG,
     LOGROTATE_CONFIG,
 ]
