@@ -6,7 +6,7 @@ REPO_NAME="remnawave-node-installer"
 # Keep the remote bootstrap independent from a moving branch. Update both values
 # together when publishing a new installer source revision.
 REPO_REF="v1.3.1-source"
-REPO_SHA256="b8ce6aa500811967858736c363a8ff26c32210fc75b163f3e395ab18b042333a"
+REPO_SHA256="96ca9ef9278a8e6fa2449da99047ab8099cb1a48ac2e772829e432540277663c"
 
 die() {
   printf '\033[31m[✗] %s\033[0m\n' "$1" >&2
